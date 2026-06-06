@@ -22,12 +22,97 @@ import regex as re
 from collections.abc import Iterable, Iterator
 from typing import BinaryIO
 from collections import defaultdict
+from multiprocessing import Pool
 import json, base64
 
 
 # GPT-2 预分词正则模式（见讲义 §2.4）。用 `regex` 模块（非内置 `re`）以支持 \p{L} 等。
 # 该模式把文本切成「预 token」: 缩写、字母串、数字串、标点串、空白串等。
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+
+# 小于此大小的语料直接串行预分词, 避免多进程启动开销反而更慢(如单元测试的小语料)。
+_PARALLEL_MIN_BYTES = 1 << 20  # 1 MiB
+
+
+def _resolve_num_processes(override: int | None = None) -> int:
+    """探测真实可用的 CPU 核数。
+
+    容器里 os.cpu_count() 会虚报宿主核数(如 128), 但 cgroup 可能只分配了 14 vCPU;
+    按虚报值开进程会在配额上互相 throttle 反而更慢。优先读 cgroup 配额拿真实核数。
+    """
+    if override:
+        return max(1, int(override))
+    try:  # cgroup v2
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max" and int(period) > 0:
+            n = int(quota) // int(period)
+            if n >= 1:
+                return n
+    except (OSError, ValueError):
+        pass
+    try:  # cgroup v1
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+            quota = int(f.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+            period = int(f.read())
+        if quota > 0 and period > 0:
+            return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+def _find_chunk_boundaries(file: BinaryIO, desired_num_chunks: int, split_special_token: bytes) -> list[int]:
+    """在 split_special_token 出现处把文件切成若干字节块边界(块数可能少于期望值)。
+
+    取自讲义 pretokenization_example.find_chunk_boundaries; 复制到此处是因为该示例文件
+    顶层含有「导入即报错」的演示代码(open(...)), 无法直接 import。
+    """
+    assert isinstance(split_special_token, bytes)
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+    chunk_size = file_size // desired_num_chunks
+    boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    boundaries[-1] = file_size
+    mini = 4096
+    for bi in range(1, len(boundaries) - 1):
+        pos = boundaries[bi]
+        file.seek(pos)
+        while True:
+            buf = file.read(mini)
+            if buf == b"":
+                boundaries[bi] = file_size
+                break
+            found = buf.find(split_special_token)
+            if found != -1:
+                boundaries[bi] = pos + found
+                break
+            pos += mini
+    return sorted(set(boundaries))
+
+
+def _pretokenize_chunk(args: tuple[str, int, int, list[str]]) -> dict[tuple[bytes, ...], int]:
+    """工作进程: 读取 [start, end) 字节块, 按特殊 token 切分后用 PAT 预分词, 返回词频 dict。
+
+    块边界落在特殊 token 处, 不会切断任何预 token; 各块独立统计再汇总, 与串行结果一致。
+    """
+    input_path, start, end, special_tokens = args
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+    segments = re.split("|".join(re.escape(t) for t in special_tokens), chunk) if special_tokens else [chunk]
+    freq: dict[tuple[bytes, ...], int] = defaultdict(int)
+    for segment in segments:
+        for m in re.finditer(PAT, segment):
+            key = tuple(bytes([b]) for b in m.group().encode("utf-8"))
+            freq[key] += 1
+    return freq
 
 
 def train_bpe(
@@ -70,25 +155,41 @@ def train_bpe(
     #         词频表的键是 tuple[bytes, ...]。可用 collections.Counter / defaultdict 提速。
     #   提示: tie-break 取最大对可写 max(pair_counts, key=lambda p: (pair_counts[p], p))。
     ###########################################################################
-    with open(input_path, encoding="utf-8") as f:
-        text = f.read()
-    
+    # ---- 初始化词表: 256 个单字节 + 特殊 token ----
     vocab = {i: bytes([i]) for i in range(256)}
     for i, special_token in enumerate(special_tokens):
         vocab[256 + i] = special_token.encode("utf-8")
-    
-    if special_tokens:
-        delimiter = "|".join(re.escape(tok) for tok in special_tokens)
-        segments = re.split(delimiter, text)
-    else:
-        segments = [text]
-    
+
+    # ---- 预分词并统计词频 ----
+    # 大文件: 在特殊 token 边界并行分块, 各进程独立统计后汇总(结果与串行逐字节一致)。
+    # 小文件 / 无特殊 token / 只切出一块: 退回串行实现, 避免多进程启动开销。
+    num_processes = _resolve_num_processes(kwargs.get("num_processes"))
+    file_size = os.path.getsize(input_path)
+    split_token = special_tokens[0].encode("utf-8") if special_tokens else None
+
     word_freq = defaultdict(int)
-    for segment in segments:
-        for m in re.finditer(PAT, segment):
-            pre_token = m.group()
-            key = tuple(bytes([b]) for b in pre_token.encode("utf-8"))
-            word_freq[key] += 1
+    boundaries: list[int] = []
+    if num_processes > 1 and split_token is not None and file_size >= _PARALLEL_MIN_BYTES:
+        with open(input_path, "rb") as f:
+            boundaries = _find_chunk_boundaries(f, num_processes, split_token)
+
+    if len(boundaries) > 2:
+        tasks = [
+            (os.fspath(input_path), start, end, special_tokens)
+            for start, end in zip(boundaries[:-1], boundaries[1:])
+        ]
+        with Pool(min(num_processes, len(tasks))) as pool:
+            for freq in pool.imap_unordered(_pretokenize_chunk, tasks):
+                for key, cnt in freq.items():
+                    word_freq[key] += cnt
+    else:
+        with open(input_path, encoding="utf-8") as f:
+            text = f.read()
+        segments = re.split("|".join(re.escape(t) for t in special_tokens), text) if special_tokens else [text]
+        for segment in segments:
+            for m in re.finditer(PAT, segment):
+                key = tuple(bytes([b]) for b in m.group().encode("utf-8"))
+                word_freq[key] += 1
             
     merges = []
     num_merges = vocab_size - len(vocab)    
