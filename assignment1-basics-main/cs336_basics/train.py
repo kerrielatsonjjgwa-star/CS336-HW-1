@@ -88,6 +88,22 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+@torch.no_grad()
+def evaluate(model, data, batch_size: int, context_length: int, device: str, eval_batches: int = 20) -> float:
+    """在数据集上估计平均交叉熵 loss（关闭梯度；多批取平均，估计更稳）。
+
+    切到 eval 模式 -> 采样 eval_batches 个批次算平均 loss -> 切回 train 模式。
+    """
+    model.eval()
+    total = 0.0
+    for _ in range(eval_batches):
+        x, y = get_batch(data, batch_size, context_length, device)
+        logits = model(x)
+        total += cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1)).item()
+    model.train()
+    return total / eval_batches
+
+
 def main() -> None:
     """训练主流程：构建数据/模型/优化器，执行训练循环并周期性保存 checkpoint。"""
     args = parse_args()
@@ -103,6 +119,7 @@ def main() -> None:
     #         若有验证集亦同样加载 valid_data；这是 1D uint16 token 序列。
     #######################################################################
     train_data = np.memmap(args.train_data, dtype=args.dtype_tokens, mode="r")
+    valid_data = None
     if args.valid_data:
         valid_data = np.memmap(args.valid_data, dtype=args.dtype_tokens, mode="r")
     #######################################################################
@@ -179,11 +196,18 @@ def main() -> None:
         #                             END OF YOUR CODE                            #
         ###################################################################
 
-        # ---- 日志（含 wandb 日志桩，默认注释掉）----
+        # ---- 训练日志（含 wandb）----
         if it % args.log_interval == 0:
             print(f"iter {it:6d} | lr {lr:.3e} | loss {loss.item():.4f}")
             if args.wandb_project is not None:
                 wandb.log({"train/loss": loss.item(), "lr": lr}, step=it)
+
+        # ---- 周期性验证集评估 + 记录 val/loss ----
+        if valid_data is not None and (it % args.eval_interval == 0 or it == args.max_iters - 1):
+            val_loss = evaluate(model, valid_data, args.batch_size, args.context_length, args.device)
+            print(f"iter {it:6d} | val/loss {val_loss:.4f}")
+            if args.wandb_project is not None:
+                wandb.log({"val/loss": val_loss}, step=it)
 
         ###################################################################
         # TODO: 周期性保存 checkpoint（含验证评估桩）。
