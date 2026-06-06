@@ -22,7 +22,7 @@
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | 校准(测速) | ✅ 完成 | ≈4 it/s @ batch128;600步/run≈3min |
-| 实验 1:LR sweep | ⏳ 进行中 | 8 个 LR(3e-5→8e-3),各 600 步 |
+| 实验 1:LR sweep | ⏳ 进行中 | 5 个 LR(1e-4→3e-3)· **full run 10k步=327.68M token** · NaN早停 |
 | 实验 2:batch sweep | ⬜ 待开始 | 增大 batch 直到 OOM |
 | 实验 3:epoch vs iteration(同 FLOPs) | ⬜ 待开始 | 两种数据加载策略对比 |
 | 实验 4:达到 val/loss < 1.45 | ⬜ 待开始 | 调参命中目标 |
