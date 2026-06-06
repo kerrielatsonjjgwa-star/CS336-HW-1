@@ -21,7 +21,7 @@ import os
 import regex as re
 from collections.abc import Iterable, Iterator
 from typing import BinaryIO
-from collections import defaultdict
+from collections import defaultdict, Counter
 from multiprocessing import Pool
 import json, base64
 
@@ -191,25 +191,56 @@ def train_bpe(
                 key = tuple(bytes([b]) for b in m.group().encode("utf-8"))
                 word_freq[key] += 1
             
+    # ---- 迭代合并: 增量词对计数(见讲义 §2.5)----
+    # 关键优化: 不再每次合并都扫描全部词重数词对, 而是只更新「含 best 的词」中变化的词对,
+    #   复杂度从 O(合并次数 × 总词元数) 降到 ~O(总词元数 + 合并次数 × 受影响词长)。
+    #   pair_count: 词对 -> 加权频次; pair_to_words: 词对 -> 含该词对的词下标集合。
+    # 输出与原「全量重数」实现逐字节一致(已用等价性脚本对照验证)。
+    words = [list(w) for w in word_freq]
+    freqs = list(word_freq.values())
+
+    pair_count: dict[tuple[bytes, bytes], int] = defaultdict(int)
+    pair_to_words: dict[tuple[bytes, bytes], set[int]] = defaultdict(set)
+    for wid, word in enumerate(words):
+        fr = freqs[wid]
+        for p in zip(word, word[1:]):
+            pair_count[p] += fr
+            pair_to_words[p].add(wid)
+
     merges = []
-    num_merges = vocab_size - len(vocab)    
+    num_merges = vocab_size - len(vocab)
     for _ in range(num_merges):
-        pair_count = defaultdict(int)
-        for word, freq in word_freq.items():
-            for a, b in zip(word, word[1:]):
-                pair_count[(a, b)] += freq
-        
         if not pair_count:
             break
-        
-        best = max(pair_count, key=lambda p: (pair_count[p], p))
-        
-        a, b = best
-        new_token = a + b
+        # 频次最高的词对; 并列时取字典序更大者(与原 tie-break 完全一致)
+        best = max(pair_count.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        new_token = best[0] + best[1]
         vocab[len(vocab)] = new_token
         merges.append(best)
-        word_freq = _merge_in_words(word_freq, best, new_token)
-    
+
+        # 仅处理包含 best 的词, 增量维护 pair_count / pair_to_words
+        for wid in list(pair_to_words[best]):
+            word = words[wid]
+            fr = freqs[wid]
+            for p, c in Counter(zip(word, word[1:])).items():          # 减去该词旧词对贡献
+                pair_count[p] -= c * fr
+                if pair_count[p] <= 0:
+                    pair_count.pop(p, None)
+                pair_to_words[p].discard(wid)
+            new_word = []                                              # 词内贪心合并 best
+            i, n = 0, len(word)
+            while i < n:
+                if i < n - 1 and word[i] == best[0] and word[i + 1] == best[1]:
+                    new_word.append(new_token)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            words[wid] = new_word
+            for p, c in Counter(zip(new_word, new_word[1:])).items():  # 加回新词对贡献
+                pair_count[p] += c * fr
+                pair_to_words[p].add(wid)
+
     return vocab, merges
 
 def _merge_in_words(word_freq, best, new_token):
