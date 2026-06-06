@@ -27,7 +27,7 @@ import torch
 from cs336_basics.model import TransformerLM
 from cs336_basics.optimizer import AdamW, get_lr_cosine_schedule
 from cs336_basics.nn_utils import cross_entropy, gradient_clipping
-from cs336_basics.data import get_batch
+from cs336_basics.data import get_batch, iter_epoch_batches
 from cs336_basics.serialization import save_checkpoint, load_checkpoint
 
 import wandb  # 可选：实验追踪（取消注释以启用 wandb 日志桩）
@@ -68,6 +68,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="余弦退火迭代数 T_c（默认取 max-iters）",
+    )
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="epoch 数：设置后启用 epoch 模式（iter_epoch_batches 无放回遍历，覆盖 --max-iters；"
+             "余弦周期自动取 epochs×每epoch步数）",
     )
 
     # ---- 数据 / checkpoint / 日志路径 ----
@@ -151,6 +158,51 @@ def main() -> None:
     # ---- 可选：初始化 wandb（日志桩，默认注释掉）----
     if args.wandb_project is not None:
         wandb.init(project=args.wandb_project, config=vars(args))
+
+    # ============ epoch 模式（--epochs 启用：无放回遍历不重叠窗口，跑完即返回）============
+    if args.epochs and args.epochs > 0:
+        steps_per_epoch = ((len(train_data) - 1) // args.context_length) // args.batch_size
+        total_steps = args.epochs * steps_per_epoch
+        print(f"[epoch 模式] {args.epochs} epoch × {steps_per_epoch} 步/epoch = {total_steps} 步（余弦周期取 {total_steps}）")
+        step = start_iter
+        for epoch in range(args.epochs):
+            for x, y in iter_epoch_batches(
+                train_data, args.batch_size, args.context_length, args.device, seed=args.seed + epoch
+            ):
+                lr = get_lr_cosine_schedule(step, args.lr, args.min_lr, args.warmup, total_steps)
+                for g in optimizer.param_groups:
+                    g["lr"] = lr
+                logits = model(x)
+                loss = cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
+                optimizer.zero_grad()
+                loss.backward()
+                gradient_clipping(model.parameters(), args.grad_clip)
+                optimizer.step()
+
+                if step % args.log_interval == 0:
+                    print(f"step {step:6d} | epoch {epoch} | lr {lr:.3e} | loss {loss.item():.4f}")
+                    if args.wandb_project is not None:
+                        wandb.log({"train/loss": loss.item(), "lr": lr}, step=step)
+                if valid_data is not None and step % args.eval_interval == 0:
+                    val_loss = evaluate(model, valid_data, args.batch_size, args.context_length, args.device)
+                    print(f"step {step:6d} | val/loss {val_loss:.4f}")
+                    if args.wandb_project is not None:
+                        wandb.log({"val/loss": val_loss}, step=step)
+                if (step + 1) % args.ckpt_interval == 0:
+                    save_checkpoint(model, optimizer, step + 1,
+                                    os.path.join(args.checkpoint_dir, f"ckpt_{step + 1}.pt"))
+                step += 1
+            print(f"===== epoch {epoch + 1}/{args.epochs} 完成（累计 {step} 步）=====")
+
+        if valid_data is not None:
+            val_loss = evaluate(model, valid_data, args.batch_size, args.context_length, args.device)
+            print(f"final | val/loss {val_loss:.4f}")
+            if args.wandb_project is not None:
+                wandb.log({"val/loss": val_loss}, step=total_steps)
+        final_path = os.path.join(args.checkpoint_dir, "ckpt_final.pt")
+        save_checkpoint(model, optimizer, total_steps, final_path)
+        print(f"训练完成（epoch 模式），最终 checkpoint -> {final_path}")
+        return
 
     # ====================== 训练主循环 ======================
     for it in range(start_iter, args.max_iters):
