@@ -6,6 +6,7 @@
 set -u
 name="$1"; shift
 export WANDB_NAME="$name"     # wandb run 名 = run_name, 便于区分 sweep 各次
+export PYTHONUNBUFFERED=1     # 关闭 stdout 块缓冲, 让 print 的 iter/loss 实时进日志
 mkdir -p experiments/runs
 log="experiments/runs/${name}.log"
 {
