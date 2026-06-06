@@ -1,0 +1,105 @@
+\subsubsection*{3.3.3 嵌入模块（Embedding Module）}
+
+如上所述，Transformer 的第一层是一个嵌入层（embedding layer），它将整数词元 ID（token ID）映射到维度为 \texttt{d\_model} 的向量空间。我们将实现一个继承自 \texttt{torch.nn.Module} 的自定义 \texttt{Embedding} 类（因此你不应使用 \texttt{nn.Embedding}）。\texttt{forward} 方法应当通过对一个形状为 \texttt{(vocab\_size, d\_model)} 的嵌入矩阵进行索引来为每个词元 ID 选取对应的嵌入向量；索引时使用一个形状为 \texttt{(batch\_size, sequence\_length)} 的 \texttt{torch.LongTensor} 词元 ID 张量。
+
+\begin{problembox}{题目 (embedding)：实现嵌入模块（1 分）}
+\textbf{交付物：} 实现继承自 \texttt{torch.nn.Module} 并执行嵌入查找的 \texttt{Embedding} 类。你的实现应遵循 PyTorch 内置 \texttt{nn.Embedding} 模块的接口。我们推荐如下接口：
+
+\medskip
+\texttt{def \_\_init\_\_(self, num\_embeddings, embedding\_dim, device=None, dtype=None)} \quad 构造一个嵌入模块。该函数应接受以下参数：
+\begin{itemize}[leftmargin=2.2em]
+  \item \texttt{num\_embeddings: int} \quad 词表大小
+  \item \texttt{embedding\_dim: int} \quad 嵌入向量的维度，即 $d_{\text{model}}$
+  \item \texttt{device: torch.device | None = None} \quad 存放参数的设备
+  \item \texttt{dtype: torch.dtype | None = None} \quad 参数的数据类型
+\end{itemize}
+
+\texttt{def forward(self, token\_ids: torch.Tensor) -> torch.Tensor} \quad 为给定的词元 ID 查找嵌入向量。
+
+\medskip
+请务必做到：
+\begin{itemize}[leftmargin=2.2em]
+  \item 继承 \texttt{nn.Module}；
+  \item 调用父类构造函数；
+  \item 将你的嵌入矩阵初始化为一个 \texttt{nn.Parameter}；
+  \item 存储嵌入矩阵时令 \texttt{d\_model} 作为最后一维；
+  \item 当然，不要使用 \texttt{nn.Embedding} 或 \texttt{nn.functional.embedding}。
+\end{itemize}
+
+同样，初始化时使用上文给出的设置，并使用 \texttt{torch.nn.init.trunc\_normal\_} 来初始化权重。
+
+为测试你的实现，请实现位于 \texttt{[adapters.run\_embedding]} 的测试适配器（test adapter）。然后运行 \texttt{uv run pytest -k test\_embedding}。
+\end{problembox}
+
+
+\subsection*{3.4 预归一化 Transformer 块（Pre-Norm Transformer Block）}
+
+每个 Transformer 块都有两个子层（sub-layer）：一个多头自注意力（multi-head self-attention）机制和一个位置前馈网络（position-wise feed-forward network）（见 A. Vaswani 等人，2017，第 3.1 节）。
+
+在最初的 Transformer 论文中，模型在两个子层各自周围使用一个残差连接（residual connection），其后接一个层归一化（layer normalization）。这种架构通常被称为“后归一化”（post-norm）Transformer，因为层归一化作用于子层的输出。然而，大量工作发现，将层归一化从每个子层的输出处移到每个子层的输入处（并在最后一个 Transformer 块之后额外加一个层归一化）能够改善 Transformer 的训练稳定性（T. Q. Nguyen 等人，2019；R. Xiong 等人，2020）——这种“预归一化”（pre-norm）Transformer 块的可视化表示见图 2。随后，每个 Transformer 块子层的输出通过残差连接被加回到该子层的输入上（见 A. Vaswani 等人，第 5.4 节）。对预归一化的一个直观理解是：存在一条从输入嵌入一直通向 Transformer 最终输出的、不含任何归一化的干净“残差流”（residual stream），据称这能改善梯度流动。如今，这种预归一化 Transformer 已成为当代语言模型（例如 GPT-3、LLaMA、PaLM 等）的标准做法，因此我们将实现这一变体。我们将逐一介绍预归一化 Transformer 块的各个组件，并依次实现它们。
+
+
+\subsubsection*{3.4.1 均方根层归一化（Root Mean Square Layer Normalization）}
+
+A. Vaswani 等人最初的 Transformer 实现使用层归一化（J. L. Ba 等人，2016）来归一化激活值。遵循 H. Touvron 等人（2023）的做法，我们将使用均方根层归一化（root mean square layer normalization，RMSNorm；B. Zhang 等人，公式 4）来进行层归一化。给定一个激活向量 $a \in \R^{d_{\text{model}}}$，RMSNorm 将按如下方式重新缩放每个激活值 $a_i$：
+\begin{equation*}
+\RMSNorm(a_i) = \frac{a_i}{\mathrm{RMS}(a)}\, g_i, \tag{4}
+\end{equation*}
+其中 $\mathrm{RMS}(a) = \sqrt{\dfrac{1}{d_{\text{model}}} \displaystyle\sum_{i=1}^{d_{\text{model}}} a_i^2 + \varepsilon}$。这里，$g_i$ 是一个可学习的“增益”（gain）参数（这样的参数共有 \texttt{d\_model} 个），而 $\varepsilon$ 是一个超参数，通常固定为 \texttt{1e-5}。
+
+为防止对输入求平方时发生溢出，你应将输入向上转型（upcast）为 \texttt{torch.float32}。总体而言，你的 \texttt{forward} 方法应当形如：
+\begin{lstlisting}
+in_dtype = x.dtype
+x = x.to(torch.float32)
+
+# Your code here performing RMSNorm
+...
+result = ...
+
+# Return the result in the original dtype
+return result.to(in_dtype)
+\end{lstlisting}
+
+\begin{problembox}{题目 (rmsnorm)：均方根层归一化（1 分）}
+\textbf{交付物：} 将 RMSNorm 实现为一个 \texttt{torch.nn.Module}。我们推荐如下接口：
+
+\medskip
+\texttt{def \_\_init\_\_(self, d\_model: int, eps: float = 1e-5, device=None, dtype=None)} \quad 构造 RMSNorm 模块。该函数应接受以下参数：
+\begin{itemize}[leftmargin=2.2em]
+  \item \texttt{d\_model: int} \quad 模型的隐藏维度
+  \item \texttt{eps: float = 1e-5} \quad 用于数值稳定性的 epsilon 值
+  \item \texttt{device: torch.device | None = None} \quad 存放参数的设备
+  \item \texttt{dtype: torch.dtype | None = None} \quad 参数的数据类型
+\end{itemize}
+
+\texttt{def forward(self, x: torch.Tensor) -> torch.Tensor} \quad 处理一个形状为 \texttt{(batch\_size, sequence\_length, d\_model)} 的输入张量，并返回一个形状相同的张量。
+
+\medskip
+\textbf{注意：} 如上所述，请记得在执行归一化之前将输入向上转型为 \texttt{torch.float32}（并在之后向下转型回原始 dtype）。
+
+为测试你的实现，请实现位于 \texttt{[adapters.run\_rmsnorm]} 的测试适配器。然后运行 \texttt{uv run pytest -k test\_rmsnorm}。
+\end{problembox}
+
+
+\subsubsection*{3.4.2 位置前馈网络（Position-Wise Feed-Forward Network）}
+
+\begin{center}
+\fbox{\parbox{0.82\linewidth}{\centering 图 3：比较 SiLU（又名 Swish）与 ReLU 激活函数。\\[2pt]
+\footnotesize（图示对比三条曲线：$\mathrm{SiLU}: f(x) = x\,\sigma(x)$；恒等映射 $\mathrm{Identity}: f(x) = x$；$\mathrm{ReLU}: f(x) = \max(0, x)$。）}}
+\end{center}
+
+在最初的 Transformer 论文中（A. Vaswani 等人第 3.3 节），Transformer 的前馈网络由两个线性变换组成，二者之间夹有一个 ReLU 激活（$\mathrm{ReLU}(x) = \max(0, x)$）。在那一最初架构中，前馈层内部维度通常是输入维度的 4 倍。
+
+然而，与这一最初设计相比，现代语言模型往往引入两项主要改动：使用另一种激活函数，并采用一种门控（gating）机制。具体而言，我们将实现 Llama 3（A. Grattafiori 等人，2024）和 Qwen 2.5（A. Yang 等人，2024）等大语言模型所采用的“SwiGLU”激活函数，它将 SiLU（常被称为 Swish）激活与一种称为门控线性单元（Gated Linear Unit，GLU）的门控机制结合起来。我们还将省略线性层中有时使用的偏置项，这遵循自 PaLM（A. Chowdhery 等人，2022）和 LLaMA（H. Touvron 等人，2023）以来大多数现代大语言模型的做法。
+
+SiLU 或 Swish 激活函数（D. Hendrycks 等人，2016；S. Elfwing 等人，2017）定义如下：
+\begin{equation*}
+\mathrm{SiLU}(x) = x \cdot \sigma(x) = \frac{x}{1 + e^{-x}} \tag{5}
+\end{equation*}
+如图 3 所示，SiLU 激活函数与 ReLU 激活函数类似，但在零点处是光滑的。
+
+门控线性单元（GLU）最初由 Y. N. Dauphin 等人定义为：一个经过 sigmoid 函数的线性变换与另一个线性变换的逐元素乘积：
+\begin{equation*}
+\mathrm{GLU}(x, W_1, W_2) = \sigma(W_1 x) \odot W_2 x, \tag{6}
+\end{equation*}
+其中 $\odot$ 表示逐元素乘法。门控线性单元被认为能够“通过为梯度提供一条线性通路、同时保留非线性能力，来缓解深层架构中的梯度消失问题”。

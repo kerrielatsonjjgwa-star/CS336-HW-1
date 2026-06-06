@@ -1,0 +1,173 @@
+\subsection*{2.5 BPE 分词器训练实验}
+
+让我们在 TinyStories 数据集上训练一个字节级（byte-level）BPE 分词器（即字节对编码，byte-pair encoding，BPE）。查找/下载数据集的说明见第 1 节。在开始之前，我们建议你先查看一下 TinyStories 数据集，以便对数据中的内容有一个直观的认识。
+
+\subsubsection*{并行化预分词（Parallelizing pre-tokenization）}
+
+你会发现一个主要的瓶颈是预分词（pre-tokenization）步骤。你可以通过使用内置库 \texttt{multiprocessing} 来并行化你的代码，从而加速预分词。具体来说，我们建议在预分词的并行实现中，将语料切分成块（chunk），同时确保你的块边界出现在某个特殊词元（special token）的开头。你可以直接逐字使用下面链接处的起始代码来获取块边界，然后用它来在各进程之间分配工作：
+
+\begin{center}
+\url{https://github.com/stanford-cs336/assignment1-basics/blob/main/cs336_basics/pretokenization_example.py}
+\end{center}
+
+这种分块方式总是有效的，因为我们永远不希望跨文档边界进行合并（merge）。就本作业而言，你总是可以这样切分。不必担心“收到一个很大的、不包含 \texttt{<|endoftext|>} 的语料”这种边界情况。
+
+\subsubsection*{预分词前移除特殊词元（Removing special tokens before pre-tokenization）}
+
+在使用正则表达式模式运行预分词（使用 \texttt{re.finditer}）之前，你应当从语料（或者你的块，如果使用并行实现的话）中剥离掉所有特殊词元。务必在你的特殊词元处进行切分，这样就不会跨越它们所分隔的文本发生合并。例如，如果你有一个像 \texttt{[Doc 1]<|endoftext|>[Doc 2]} 这样的语料（或块），你应当在特殊词元 \texttt{<|endoftext|>} 处切分，并分别对 \texttt{[Doc 1]} 和 \texttt{[Doc 2]} 进行预分词，从而不会跨文档边界发生合并。换句话说，在训练过程中特殊词元定义了硬性的切分边界（hard segmentation boundary），但它们本身不应当贡献于合并计数。这可以通过用 \texttt{re.split} 并以 \texttt{"|".join(special\_tokens)} 作为分隔符来完成（要谨慎使用 \texttt{re.escape}，因为 \texttt{|} 可能出现在特殊词元中）。测试 \texttt{test\_train\_bpe\_special\_tokens} 会对此进行检验。
+
+\subsubsection*{优化合并步骤（Optimizing the merging step）}
+
+上面那个程式化示例中 BPE 训练的朴素（naïve）实现很慢，因为对于每一次合并，它都要遍历所有字节对（byte pair）以找出最频繁的那一对。然而，在每次合并之后，唯一发生变化的字节对计数是那些与被合并字节对相重叠的计数。因此，可以通过对所有字节对的计数建立索引并增量式地更新这些计数，而不是显式地遍历每一对字节来统计字节对频率，从而提升 BPE 训练速度。通过这种缓存（caching）做法你可以获得显著的加速，不过我们要指出，BPE 训练中的合并部分在 Python 中是无法并行化的。
+
+\begin{tipbox}{低资源提示：性能剖析（Profiling）}
+你应当使用诸如 \texttt{cProfile} 或 \texttt{py-spy} 之类的性能剖析工具来识别你实现中的瓶颈，并集中精力优化这些瓶颈。
+\end{tipbox}
+
+\begin{tipbox}{低资源提示：“降尺度”（Downscaling）}
+不要一上来就在完整的 TinyStories 数据集上训练你的分词器，我们建议你先在数据的一个小子集——一个“调试数据集”（debug dataset）——上训练。例如，你可以改用 TinyStories 的验证集来训练你的分词器，它只有 22K 个文档，而不是 2.12M 个文档。这体现了一种通用策略：只要可能就进行降尺度，以加速开发，例如使用更小的数据集、更小的模型规模等等。选择调试数据集的大小或超参数配置需要仔细斟酌：你希望你的调试集足够大，以便具有与完整配置相同的瓶颈（这样你所做的优化才能泛化），但又不要大到运行起来要花很久。
+\end{tipbox}
+
+\begin{problembox}{题目 (train\_bpe)：BPE 分词器训练（15 分）}
+\textbf{交付物：} 编写一个函数，给定一个输入文本文件的路径，训练一个（字节级）BPE 分词器。你的 BPE 训练函数应当（至少）处理以下输入参数：
+
+\textbf{输入（Input）}
+\begin{itemize}[leftmargin=2em]
+\item \texttt{input\_path: str}\quad 指向含 BPE 分词器训练数据的文本文件的路径。
+\item \texttt{vocab\_size: int}\quad 一个正整数，定义最终词表的最大大小（包括初始的字节词表、由合并产生的词表项，以及任何特殊词元）。
+\item \texttt{special\_tokens: list[str]}\quad 要添加到词表中的字符串列表。在训练过程中，将它们视为阻止跨其跨度进行合并的硬性边界，但在计算合并统计量时不要包含它们。
+\end{itemize}
+
+你的 BPE 训练函数应当返回所得到的词表和合并：
+
+\textbf{输出（Output）}
+\begin{itemize}[leftmargin=2em]
+\item \texttt{vocab: dict[int, bytes]}\quad 分词器词表，一个从 \texttt{int}（词表中的词元 ID）到 \texttt{bytes}（词元字节）的映射。
+\item \texttt{merges: list[tuple[bytes, bytes]]}\quad 训练产生的 BPE 合并列表。每个列表项是一个字节元组 \texttt{(<token1>, <token2>)}，表示 \texttt{<token1>} 与 \texttt{<token2>} 被合并。这些合并应当按创建顺序排列。
+\end{itemize}
+
+要用我们提供的测试来检验你的 BPE 训练函数，你首先需要实现 \texttt{[adapters.run\_train\_bpe]} 处的测试适配器。然后，运行 \texttt{uv run pytest tests/test\_train\_bpe.py}。你的实现应当能够通过所有测试。可选地（这可能是一项较大的时间投入），你可以用某种系统级语言来实现你训练方法的关键部分，例如 C++（可考虑 \texttt{cppyy} 或 \texttt{nanobind}）或 Rust（使用 \texttt{PyO3}）。如果你这样做，要注意哪些操作需要拷贝、哪些可以直接从 Python 内存读取，并务必留下构建说明，或者确保它仅用 \texttt{pyproject.toml} 即可构建。还要注意，GPT-2 的正则表达式在大多数正则引擎中支持得并不好，并且在大多数支持它的引擎中也会太慢。我们已验证 Oniguruma 速度尚可且支持负向先行断言（negative lookahead），但 Python 的 \texttt{regex} 包如果说有什么不同的话，那就是更快。
+\end{problembox}
+
+\begin{problembox}{题目 (train\_bpe\_tinystories)：在 TinyStories 上训练 BPE（2 分）}
+（a）在 TinyStories 数据集上训练一个字节级 BPE 分词器，使用 10{,}000 的最大词表大小。务必将 TinyStories 的 \texttt{<|endoftext|>} 特殊词元添加到词表中。将所得到的词表和合并序列化到磁盘以供进一步检查。训练花了多少时间和内存？词表中最长的词元是什么？它有意义吗？
+
+\textit{资源要求：} $\leq$ 30 分钟（无 GPU），$\leq$ 30 GB 内存
+
+\medskip
+\textbf{提示（Hint）} 在预分词期间使用 \texttt{multiprocessing}，并结合下面这两个事实，你应当能把 BPE 训练时间压到 2 分钟以内：
+\begin{itemize}[leftmargin=2em]
+\item[(a)] \texttt{<|endoftext|>} 词元在数据文件中分隔文档。
+\item[(b)] \texttt{<|endoftext|>} 词元在应用 BPE 合并之前作为特殊情形处理。
+\end{itemize}
+\textbf{交付物：} 一到两句话的回答。
+
+\medskip
+（b）对你的代码进行性能剖析。分词器训练过程中的哪一部分耗时最多？
+
+\textbf{交付物：} 一到两句话的回答。
+\end{problembox}
+
+接下来，我们将尝试在 OpenWebText 数据集上训练一个字节级 BPE 分词器。和之前一样，我们建议你先查看一下数据集，以便更好地理解它的内容。
+
+\begin{problembox}{题目 (train\_bpe\_expts\_owt)：在 OpenWebText 上训练 BPE（2 分）}
+（a）在 OpenWebText 数据集上训练一个字节级 BPE 分词器，使用 32{,}000 的最大词表大小。将所得到的词表和合并序列化到磁盘以供进一步检查。词表中最长的词元是什么？它有意义吗？
+
+\textit{资源要求：} $\leq$ 12 小时（无 GPU），$\leq$ 100 GB 内存
+
+\textbf{交付物：} 一到两句话的回答。
+
+\medskip
+（b）对比你在 TinyStories 上和在 OpenWebText 上得到的分词器，指出它们的异同。
+
+\textbf{交付物：} 一到两句话的回答。
+\end{problembox}
+
+\subsection*{2.6 BPE 分词器：编码与解码}
+
+在本作业的上一部分中，我们实现了一个函数，在输入文本上训练一个 BPE 分词器，以获得一个分词器词表和一个 BPE 合并列表。现在，我们将实现一个 BPE 分词器，它加载所提供的词表和合并列表，并用它们在文本与词元 ID 之间进行编码和解码。
+
+\subsubsection*{2.6.1 文本编码}
+
+用 BPE 编码文本的过程与我们训练 BPE 词表的方式相对应。其中有几个主要步骤。
+
+\textbf{第 1 步：预分词。} 我们首先对序列进行预分词，并将每个预词元（pre-token）表示为一个 UTF-8 字节序列，这与我们在 BPE 训练中所做的完全一样。我们将在每个预词元内部把这些字节合并为词表元素，并独立地处理每个预词元（不跨预词元边界进行合并）。
+
+\textbf{第 2 步：应用合并。} 接着我们取出 BPE 训练期间创建的词表元素合并序列，并按相同的创建顺序将其应用到我们的预词元上。
+
+\begin{problembox}{示例 (bpe\_encoding)：BPE 编码示例}
+例如，假设我们的输入字符串是 \texttt{'the cat ate'}，我们的词表是
+\begin{center}
+\texttt{\{0: b' ', 1: b'a', 2: b'c', 3: b'e', 4: b'h', 5: b't', 6: b'th', 7: b' c', 8: b' a', 9: b'the', 10: b' at'\}}，
+\end{center}
+而我们学习到的合并是
+\begin{center}
+\texttt{[(b't', b'h'), (b' ', b'c'), (b' ', b'a'), (b'th', b'e'), (b' a', b't')]}。
+\end{center}
+首先，我们的预分词器会把这个字符串切分成 \texttt{['the', ' cat', ' ate']}。然后，我们将逐个查看每个预词元并应用 BPE 合并。
+
+第一个预词元 \texttt{'the'} 最初被表示为 \texttt{[b't', b'h', b'e']}。查看我们的合并列表，我们确定第一个可应用的合并是 \texttt{(b't', b'h')}，并用它把该预词元变换为 \texttt{[b'th', b'e']}。接着，我们回到合并列表，确定下一个可应用的合并是 \texttt{(b'th', b'e')}，它把该预词元变换为 \texttt{[b'the']}。最后，再回头查看合并列表，我们看到没有更多合并可以应用于这个字符串了（因为整个预词元已被合并成单个词元），所以我们应用 BPE 合并的工作就完成了。其对应的整数序列是 \texttt{[9]}。
+
+对其余预词元重复这一过程，我们看到预词元 \texttt{' cat'} 在应用 BPE 合并后被表示为 \texttt{[b' c', b'a', b't']}，它变成整数序列 \texttt{[7, 1, 5]}。最后一个预词元 \texttt{' ate'} 在应用 BPE 合并后是 \texttt{[b' at', b'e']}，它变成整数序列 \texttt{[10, 3]}。因此，编码我们输入字符串的最终结果是 \texttt{[9, 7, 1, 5, 10, 3]}。
+\end{problembox}
+
+\subsubsection*{特殊词元（Special tokens）}
+
+你的分词器在编码文本时应当能够正确处理用户自定义的特殊词元（在构造分词器时提供）。
+
+\subsubsection*{内存方面的考量（Memory considerations）}
+
+假设我们想对一个无法放入内存的大型文本文件进行分词。为了高效地对这个大文件（或任何其他数据流）进行分词，我们需要把它分解成可管理的块，并依次处理每一块，使得内存复杂度是常数级的，而不是随文本大小线性增长。在这样做时，我们需要确保某个词元不会跨越块边界，否则我们得到的分词结果会与在内存中对整个序列进行分词的朴素方法不同。
+
+\subsubsection*{2.6.2 文本解码}
+
+要将一个整数词元 ID 序列解码回原始文本，我们可以简单地在词表中查找每个 ID 对应的条目（一个字节序列），把它们拼接在一起，然后把这些字节解码为一个 Unicode 字符串。注意，输入的 ID 并不保证能映射到有效的 Unicode 字符串（因为用户可以输入任意的整数 ID 序列）。在输入的词元 ID 不能产生有效 Unicode 字符串的情况下，你应当用官方的 Unicode 替换字符（replacement character）U+FFFD 来替换格式错误的字节。\footnote{关于 Unicode 替换字符的更多信息，参见 \url{https://en.wikipedia.org/wiki/Specials_(Unicode_block)\#Replacement_character}。} \texttt{bytes.decode} 的 \texttt{errors} 参数控制如何处理 Unicode 解码错误，使用 \texttt{errors='replace'} 会自动用替换标记来替换格式错误的数据。
+
+\begin{problembox}{题目 (tokenizer)：实现分词器（15 分）}
+\textbf{交付物：} 实现一个 \texttt{Tokenizer} 类，给定一个词表和一个合并列表，它将文本编码为整数 ID，并将整数 ID 解码为文本。你的分词器还应当支持用户提供的特殊词元（如果它们尚不在词表中，就将其追加到词表里）。我们建议采用以下接口：
+
+\medskip
+\texttt{def \_\_init\_\_(self, vocab, merges, special\_tokens=None)}\quad 从给定的词表、合并列表以及（可选的）特殊词元列表构造一个分词器。该函数应当接受以下参数：
+\begin{itemize}[leftmargin=2em]
+\item \texttt{vocab: dict[int, bytes]}
+\item \texttt{merges: list[tuple[bytes, bytes]]}
+\item \texttt{special\_tokens: list[str] | None = None}
+\end{itemize}
+
+\texttt{def from\_files(cls, vocab\_filepath, merges\_filepath, special\_tokens=None)}\quad 一个类方法，它从序列化的词表和合并列表（格式与你的 BPE 训练代码的输出相同）以及（可选的）特殊词元列表构造并返回一个 \texttt{Tokenizer}。该方法应当接受以下附加参数：
+\begin{itemize}[leftmargin=2em]
+\item \texttt{vocab\_filepath: str}
+\item \texttt{merges\_filepath: str}
+\item \texttt{special\_tokens: list[str] | None = None}
+\end{itemize}
+
+\texttt{def encode(self, text: str) -> list[int]}\quad 将一段输入文本编码为一个词元 ID 序列。
+
+\texttt{def encode\_iterable(self, iterable: Iterable[str]) -> Iterator[int]}\quad 给定一个字符串的可迭代对象（例如一个 Python 文件句柄），返回一个惰性地逐个产出（yield）词元 ID 的生成器。这对于无法直接加载到内存中的大文件的内存高效分词是必需的。
+
+\texttt{def decode(self, ids: list[int]) -> str}\quad 将一个词元 ID 序列解码为文本。
+
+\medskip
+要用我们提供的测试来检验你的 \texttt{Tokenizer}，你首先需要实现 \texttt{[adapters.get\_tokenizer]} 处的测试适配器。然后，运行 \texttt{uv run pytest tests/test\_tokenizer.py}。你的实现应当能够通过所有测试。
+\end{problembox}
+
+\subsection*{2.7 实验}
+
+\begin{problembox}{题目 (tokenizer\_experiments)：分词器实验（4 分）}
+（a）从 TinyStories 和 OpenWebText 中各采样 10 个文档。使用你此前训练好的 TinyStories 和 OpenWebText 分词器（词表大小分别为 10K 和 32K），把这些采样到的文档编码为整数 ID。每个分词器的压缩比（compression ratio，字节/词元）是多少？
+
+\textbf{交付物：} 一到两句话的回答。
+
+\medskip
+（b）如果你用 TinyStories 分词器对你的 OpenWebText 样本进行分词，会发生什么？比较压缩比，和/或定性地描述会发生什么。
+
+\textbf{交付物：} 一到两句话的回答。
+
+\medskip
+（c）估计你的分词器的吞吐量（例如以字节/秒计）。对 Pile 数据集（825GB 文本）进行分词要花多长时间？
+
+\textbf{交付物：} 一到两句话的回答。
+
+\medskip
+（d）使用你的 TinyStories 和 OpenWebText 分词器，把各自的训练集和开发集编码为整数词元 ID 序列。我们稍后将用它来训练我们的
+\end{problembox}

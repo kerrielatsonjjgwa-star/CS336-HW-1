@@ -1,0 +1,203 @@
+\subsubsection*{3.4.3 相对位置编码（Relative Positional Embeddings）}
+
+为了把位置信息注入模型，我们将实现旋转位置编码（Rotary Position Embeddings）[J. Su 等人，2021]，通常称为 RoPE。对于位于词元位置 $i$ 处的某个查询词元 $q^{(i)} = W_q x^{(i)} \in \R^{d}$，我们将对其施加一个成对旋转矩阵（pairwise rotation matrix）$R_i$，得到 $q'^{(i)} = R_i q^{(i)} = R_i W_q x^{(i)}$。这里，$R_i$ 会把成对的嵌入元素 $q^{(i)}_{2k-1:2k}$ 当作二维向量，按角度 $\theta_{i,k} = \dfrac{i}{\Theta^{(2k-2)/d}}$ 旋转，其中 $k \in \{1, \dots, d/2\}$，$\Theta$ 为某个常数。因此，我们可以把 $R^i$ 看作一个大小为 $d \times d$ 的分块对角矩阵（block-diagonal matrix），其各个分块为 $R^i_k$（$k \in \{1, \dots, \tfrac{d}{2}\}$），其中
+
+\begin{equation*}
+R^i_k =
+\begin{pmatrix}
+\cos(\theta_{i,k}) & -\sin(\theta_{i,k}) \\
+\sin(\theta_{i,k}) & \cos(\theta_{i,k})
+\end{pmatrix}
+\tag{8}
+\end{equation*}
+
+于是我们得到完整的旋转矩阵
+
+\begin{equation*}
+R^i =
+\begin{pmatrix}
+R^i_1 & 0 & 0 & \cdots & 0 \\
+0 & R^i_2 & 0 & \cdots & 0 \\
+0 & 0 & R^i_3 & \cdots & 0 \\
+\vdots & \vdots & \vdots & \ddots & \vdots \\
+0 & 0 & 0 & \cdots & R^i_{d/2}
+\end{pmatrix},
+\tag{9}
+\end{equation*}
+
+其中各个 $0$ 代表 $2 \times 2$ 的零矩阵。虽然我们可以直接构造完整的 $d \times d$ 矩阵，但一个好的实现应当利用该矩阵的性质，以更高效的方式实现这一变换。由于我们只关心给定序列内各词元之间的相对旋转，因此可以在不同层、不同批次之间复用我们为 $\cos(\theta_{i,k})$ 与 $\sin(\theta_{i,k})$ 计算出的数值。如果你想对其进行优化，可以使用一个被所有层共同引用的单一 RoPE 模块，并让它在初始化时通过 \texttt{self.register\_buffer(persistent=False)} 创建一个预先计算好的二维 sin 与 cos 数值缓冲区（buffer），而不是使用 \texttt{nn.Parameter}（因为我们并不想学习这些固定的余弦与正弦值）。我们对 $q^{(i)}$ 所做的旋转过程，会以完全相同的方式对 $k^{(j)}$ 进行，按照对应的 $R_j$ 进行旋转。注意，这一层没有任何可学习参数。
+
+\begin{problembox}{题目 (rope)：实现 RoPE（2 分）}
+\textbf{交付物：} 实现一个类 \texttt{RotaryPositionalEmbedding}，将 RoPE 施加到输入张量上。
+
+推荐采用如下接口：
+
+\texttt{def \_\_init\_\_(self, theta: float, d\_k: int, max\_seq\_len: int, device=None)} 构造 RoPE 模块，并在需要时创建缓冲区。
+\begin{itemize}[leftmargin=2.4em]
+  \item \texttt{theta: float}\quad RoPE 所用的 $\Theta$ 值
+  \item \texttt{d\_k: int}\quad 查询向量与键向量的维度
+  \item \texttt{max\_seq\_len: int}\quad 将要输入的最大序列长度
+  \item \texttt{device: torch.device | None = None}\quad 用于存储缓冲区的设备
+\end{itemize}
+
+\texttt{def forward(self, x: torch.Tensor, token\_positions: torch.Tensor) -> torch.Tensor} 处理一个形状为 \texttt{(..., seq\_len, d\_k)} 的输入张量，并返回一个形状相同的张量。注意，你应当能容忍 $x$ 带有任意数量的批次维度（batch dimension）。你可以假设 token positions 是一个形状为 \texttt{(..., seq\_len)} 的张量，指定了 $x$ 沿序列维度的各词元位置。
+
+你应当使用 token positions 来沿序列维度对（可能已预先计算好的）cos 与 sin 张量进行切片。
+
+为测试你的实现，请补全 \texttt{[adapters.run\_rope]}，并确保通过 \texttt{uv run pytest -k test\_rope}。
+\end{problembox}
+
+\subsubsection*{3.4.4 缩放点积注意力（Scaled Dot-Product Attention）}
+
+我们现在将实现 A. Vaswani 等人 [8]（第 3.2.1 节）所描述的缩放点积注意力（scaled dot-product attention）。作为一个预备步骤，注意力（attention）运算的定义将用到 softmax，这是一种把一组未归一化的分数向量转化为归一化分布的运算：
+
+\begin{equation*}
+\softmax(v)_i = \frac{\exp(v_i)}{\sum_{j=1}^{n} \exp(v_j)}.
+\tag{10}
+\end{equation*}
+
+注意，对于较大的数值，$\exp(v_i)$ 可能会变成 inf（此时 $\tfrac{\text{inf}}{\text{inf}} = \text{NaN}$）。我们可以利用一个事实来规避这一点：softmax 运算对于给所有输入加上任意常数 $c$ 是不变的。我们可以利用这一性质来获得数值稳定性——通常我们会从 $v$ 的所有元素中减去 $v$ 的最大项，使新的最大项变为 $0$。下面你将实现 softmax，并使用这个技巧来保证数值稳定性。
+
+\begin{problembox}{题目 (softmax)：实现 softmax（1 分）}
+\textbf{交付物：} 编写一个函数，对张量施加 softmax 运算。你的函数应当接收两个参数：一个张量和一个维度 $i$，并对输入张量的第 $i$ 维施加 softmax。输出张量的形状应与输入张量相同，但其第 $i$ 维现在将是一个归一化的概率分布。请使用从第 $i$ 维所有元素中减去该维最大值的技巧，以避免数值稳定性问题。
+
+为测试你的实现，请补全 \texttt{[adapters.run\_softmax]}，并确保通过 \texttt{uv run pytest -k test\_softmax\_matches\_pytorch}。
+\end{problembox}
+
+现在我们可以在数学上把注意力运算定义如下：
+
+\begin{equation*}
+\mathrm{Attention}(Q, K, V) = \softmax\!\left(\frac{QK^{T}}{\sqrt{d_k}}\right) V
+\tag{11}
+\end{equation*}
+
+其中 $Q \in \R^{n \times d_k}$，$K \in \R^{m \times d_k}$，$V \in \R^{m \times d_v}$。这里，$Q$、$K$、$V$ 都是该运算的输入——注意它们并不是可学习参数。
+
+\textbf{掩码（Masking）：} 有时对注意力运算的输出进行掩码处理会很方便。一个掩码（mask）应当具有形状 $M \in \{\text{True}, \text{False}\}^{n \times m}$，这个布尔矩阵的每一行 $i$ 都指明了查询 $i$ 应当关注哪些键。按照惯例（且略微令人困惑），位置 $(i, j)$ 处取值为 True 表示查询 $i$ \emph{会}关注键 $j$，取值为 False 表示查询\emph{不}关注该键。换言之，"信息流动"发生在取值为 True 的 $(i, j)$ 对上。例如，考虑一个 $1 \times 3$ 的掩码矩阵，其元素为 \texttt{[[True, True, False]]}。这唯一的查询向量只会关注前两个键。
+
+在计算上，使用掩码会比在子序列上计算注意力高效得多；我们可以这样做：取 softmax 之前的值（$QK^{\top}/\sqrt{d_k}$），并对掩码矩阵中任何取值为 False 的项加上 $-\infty$。
+
+\begin{problembox}{题目 (scaled\_dot\_product\_attention)：实现缩放点积注意力（5 分）}
+\textbf{交付物：} 实现缩放点积注意力函数。你的实现应当能处理形状为 \texttt{(batch\_size, ..., seq\_len, d\_k)} 的键与查询，以及形状为 \texttt{(batch\_size, ..., seq\_len, d\_v)} 的值，其中 \texttt{...} 代表任意数量的其他类批次（batch-like）维度（如有提供）。该实现应返回一个形状为 \texttt{(batch\_size, ..., seq\_len, d\_v)} 的输出。关于类批次维度的讨论，见 §3.2。
+
+你的实现还应支持一个由用户提供的、可选的布尔掩码，其形状为 \texttt{(seq\_len, seq\_len)}。掩码取值为 True 的各位置上的注意力概率应共同求和为 1，而掩码取值为 False 的各位置上的注意力概率应为零。
+
+为针对我们提供的测试来测试你的实现，你需要补全测试适配器 \texttt{[adapters.run\_scaled\_dot\_product\_attention]}。\texttt{uv run pytest -k test\_scaled\_dot\_product\_attention} 会在三阶输入张量上测试你的实现，而 \texttt{uv run pytest -k test\_4d\_scaled\_dot\_product\_attention} 会在四阶输入张量上测试你的实现。
+\end{problembox}
+
+\subsubsection*{3.4.5 因果多头自注意力（Causal Multi-Head Self-Attention）}
+
+我们将实现 A. Vaswani 等人 [8] 第 3.2.2 节所描述的多头自注意力（multi-head self-attention）。回顾一下，多头注意力运算在数学上定义如下：
+
+\begin{align*}
+\mathrm{MultiHead}(Q, K, V) &= \mathrm{Concat}(\mathrm{head}_1, \dots, \mathrm{head}_h) \tag{12} \\
+\text{for } \mathrm{head}_i &= \mathrm{Attention}(Q_i, K_i, V_i) \tag{13}
+\end{align*}
+
+其中 $Q_i, K_i, V_i$ 分别是 $Q$、$K$、$V$ 的嵌入维度上的第 $i$ 个切片（$i \in \{1, \dots, h\}$），大小为 $d_k$ 或 $d_v$。这里的 Attention 即第 3.4.4 节所定义的缩放点积注意力运算。由此我们可以构造出多头自注意力运算：
+
+\begin{equation*}
+\mathrm{MultiHeadSelfAttention}(x) = W_O\, \mathrm{MultiHead}(W_Q x, W_K x, W_V x)
+\tag{14}
+\end{equation*}
+
+这里，可学习参数为 $W_Q \in \R^{h d_k \times d_{\text{model}}}$、$W_K \in \R^{h d_k \times d_{\text{model}}}$、$W_V \in \R^{h d_v \times d_{\text{model}}}$，以及 $W_O \in \R^{d_{\text{model}} \times h d_v}$。由于在多头注意力运算中 $Q$、$K$、$V$ 是被切片的，我们可以把 $W_Q$、$W_K$、$W_V$ 看作沿输出维度为每个头分离开来。当这部分能正常工作时，你应当只用总共三次矩阵乘法就计算出键、值、查询的投影。\footnote{作为一个进阶目标（stretch goal），可尝试把键、查询、值的投影合并到单个权重矩阵中，这样你就只需要一次矩阵乘法。}
+
+\paragraph*{因果掩码（Causal masking）}
+你的实现应当阻止模型关注序列中的未来词元。换言之，如果给模型一个词元序列 $t_1, \dots, t_n$，而我们想为前缀 $t_1, \dots, t_i$（其中 $i < n$）计算下一个词的预测，那么模型不应能够访问（关注）位置 $t_{i+1}, \dots, t_n$ 处的词元表示，因为在推理（inference）阶段生成文本时模型并无法访问这些词元（而且这些未来词元会泄露真实下一个词的身份信息，使语言建模预训练目标变得平凡）。对于一个输入词元序列 $t_1, \dots, t_n$，我们可以通过把多头自注意力运行 $n$ 次（对应序列中 $n$ 个不同的前缀）来天真地阻止对未来词元的访问。但我们将改用因果注意力掩码（causal attention masking），它允许词元 $i$ 关注序列中所有满足 $j \le i$ 的位置 $j$。你可以使用 \texttt{torch.triu} 或广播式的索引比较来构造该掩码，并且你应当利用一个事实：你在第 3.4.4 节中实现的缩放点积注意力已经支持注意力掩码。
+
+\paragraph*{施加 RoPE（Applying RoPE）}
+RoPE 应当被施加到查询向量和键向量上，但不施加到值向量上。此外，头（head）维度应当作为一个批次维度来处理，因为在多头注意力中，注意力是为每个头独立施加的。这意味着对每个头的查询向量和键向量都应当施加完全相同的 RoPE 旋转。
+
+\begin{problembox}{题目 (multihead\_self\_attention)：实现因果多头自注意力（5 分）}
+\textbf{交付物：} 把因果多头自注意力实现为一个 \texttt{torch.nn.Module}。你的实现应当（至少）接收如下参数：
+
+\begin{itemize}[leftmargin=2.4em]
+  \item \texttt{d\_model: int}\quad Transformer 块输入的维度。
+  \item \texttt{num\_heads: int}\quad 多头自注意力中使用的头数。
+\end{itemize}
+
+参照 A. Vaswani 等人 [8]，设 $d_k = d_v = \dfrac{d_{\text{model}}}{h}$。为针对我们提供的测试来测试你的实现，请实现测试适配器 \texttt{[adapters.run\_multihead\_self\_attention]}。然后运行 \texttt{uv run pytest -k test\_multihead\_self\_attention} 来测试你的实现。
+\end{problembox}
+
+\subsection*{3.5 完整的 Transformer 语言模型（The Full Transformer LM）}
+
+我们先从组装 Transformer 块（Transformer block）开始（回顾图 2 会有所帮助）。一个 Transformer 块包含两个"子层"（sub-layer），一个用于多头自注意力，另一个用于 SwiGLU 前馈网络（feed-forward network）。在每个子层中，我们首先执行 RMSNorm，然后执行主运算（MHA/FF），最后加上残差连接（residual connection）。
+
+具体来说，Transformer 块的前半部分（第一个"子层"）应当实现如下一组更新，从输入 $x$ 产生输出 $y$：
+
+\begin{equation*}
+y = x + \mathrm{MultiHeadSelfAttention}(\RMSNorm(x)).
+\tag{15}
+\end{equation*}
+
+\begin{problembox}{题目 (transformer\_block)：实现 Transformer 块（3 分）}
+实现第 3.4 节所描述、并在图 2 中所示的预归一化（pre-norm）Transformer 块。你的 Transformer 块应当（至少）接收如下参数：
+
+\begin{itemize}[leftmargin=2.4em]
+  \item \texttt{d\_model: int}\quad Transformer 块输入的维度。
+  \item \texttt{num\_heads: int}\quad 多头自注意力中使用的头数。
+  \item \texttt{d\_ff: int}\quad 逐位置前馈层内部层的维度。
+\end{itemize}
+
+为测试你的实现，请实现适配器 \texttt{[adapters.run\_transformer\_block]}。然后运行 \texttt{uv run pytest -k test\_transformer\_block} 来测试你的实现。
+
+\textbf{交付物：} 能通过所提供测试的 Transformer 块代码。
+\end{problembox}
+
+现在我们把这些块拼装起来，遵循图 1 中的高层示意图。按照第 3.1.0.1 节中我们对嵌入（embedding）的描述，将其输入到 \texttt{num\_layers} 个 Transformer 块中，然后再传入最后的层归一化（layer norm）和语言模型头（LM head），以得到一个在词表上的未归一化分布（即 logits）。
+
+\begin{problembox}{题目 (transformer\_lm)：实现 Transformer 语言模型（3 分）}
+是时候把所有部分整合到一起了！实现第 3.1 节所描述、并在图 1 中所示的 Transformer 语言模型。你的实现至少应当接收前面提到的 Transformer 块的所有构造参数，以及如下这些额外参数：
+
+\begin{itemize}[leftmargin=2.4em]
+  \item \texttt{vocab\_size: int}\quad 词表大小，用于确定词元嵌入矩阵的维度。
+  \item \texttt{context\_length: int}\quad 最大上下文长度，用于确定 RoPE 的 sin 与 cos 缓冲区的维度。
+  \item \texttt{num\_layers: int}\quad 要使用的 Transformer 块的数量。
+\end{itemize}
+
+为针对我们提供的测试来测试你的实现，你需要先实现测试适配器 \texttt{[adapters.run\_transformer\_lm]}。然后运行 \texttt{uv run pytest -k test\_transformer\_lm} 来测试你的实现。
+
+\textbf{交付物：} 一个能通过上述测试的 Transformer 语言模型模块。
+\end{problembox}
+
+\paragraph*{资源核算（Resource accounting）}
+能够理解 Transformer 的各个部分如何消耗计算和内存是很有用的。我们将一步步进行一些基本的"FLOPs 核算"。Transformer 中绝大多数的 FLOPS 都是矩阵乘法，因此我们的核心方法很简单：
+
+\begin{enumerate}[leftmargin=2.0em]
+  \item 写下 Transformer 前向传播中的所有矩阵乘法。
+  \item 把每个矩阵乘法换算为所需的 FLOPs。
+\end{enumerate}
+
+对于第二步，下面这个事实会很有用：
+
+\begin{tipbox}{规则}
+给定 $A \in \R^{m \times n}$ 与 $B \in \R^{n \times p}$，矩阵-矩阵乘积 $AB$ 需要 $2mnp$ 次 FLOPs。
+\end{tipbox}
+
+为说明这一点，注意到 $(AB)[i, j] = A[i, :] \cdot B[:, j]$，而这个点积需要 $n$ 次加法和 $n$ 次乘法（共 $2n$ 次 FLOPs）。然后，由于矩阵-矩阵乘积 $AB$ 有 $m \times p$ 个元素，FLOPS 的总数为 $(2n)(mp) = 2mnp$。
+
+现在，在做下一道题之前，逐一过一遍你的 Transformer 块和 Transformer 语言模型的每个组成部分，列出所有矩阵乘法及其相应的 FLOPs 开销，会很有帮助。
+
+\begin{problembox}{题目 (transformer\_accounting)：Transformer 语言模型资源核算（5 分）}
+（a）考虑一个使用我们作业架构、规模与 GPT-2 XL 相当的模型，其配置如下：
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\texttt{vocab\_size:} & 50{,}257 \\
+\texttt{context\_length:} & 1{,}024 \\
+\texttt{num\_layers:} & 48 \\
+\texttt{d\_model:} & 1{,}600 \\
+\texttt{num\_heads:} & 25 \\
+\texttt{d\_ff:} & 4{,}288（最接近 $\tfrac{8}{3} \times 1{,}600$ 的 64 的倍数）\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+假设我们用这个配置构造模型。我们的模型会有多少个可训练参数？假设每个参数用单精度浮点数（single-precision floating point）表示，仅仅加载这个模型需要多少内存？
+
+\textbf{交付物：} 一到两句话的回答。
+
+（b）找出完成我们这个 GPT-2 XL 形状模型的一次前向传播所需的矩阵乘法。这些矩阵乘法总共需要多少 FLOPs？假设我们的输入序列含有 \texttt{context\_length} 个词元。
+\end{problembox}

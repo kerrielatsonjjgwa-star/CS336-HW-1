@@ -1,0 +1,292 @@
+% ============================================================
+% CS336 作业一（基础）：构建 Transformer 语言模型
+% 正文片段：标题页 + §1 + §2 ~ §2.4（开头）
+% 覆盖原文第 1--7 页
+% ============================================================
+
+\begin{center}
+  {\LARGE\bfseries CS336 作业一（基础）：构建 Transformer 语言模型}\\[1.2ex]
+  {\normalsize 版本 26.0.3}\\[0.4ex]
+  {\normalsize CS336 教学团队}\\[0.4ex]
+  {\normalsize 2026 年春季}
+\end{center}
+
+\vspace{1.2em}
+
+\section*{1 作业概览}
+
+在本作业中，你将从零开始构建训练一个标准 Transformer 语言模型（language model，LM）所需的全部组件，并训练若干个模型。
+
+\subsubsection*{你将实现的内容}
+
+\begin{enumerate}[leftmargin=2.2em]
+  \item 字节对编码（byte-pair encoding，BPE）分词器（第 2 节）
+  \item Transformer 语言模型（LM）（第 3 节）
+  \item 交叉熵损失（cross-entropy loss）函数与 AdamW 优化器（第 4 节）
+  \item 训练循环，并支持模型与优化器状态的序列化（serialize）与加载（第 5 节）
+\end{enumerate}
+
+\subsubsection*{你将运行的内容}
+
+\begin{enumerate}[leftmargin=2.2em]
+  \item 在 TinyStories 数据集上训练 BPE 分词器。
+  \item 用训练好的分词器对数据集进行编码，将其转换为整数 ID 序列。
+  \item 在 TinyStories 数据集上训练 Transformer LM。
+  \item 使用训练好的 Transformer LM 进行采样生成，并评估困惑度（perplexity）。
+  \item 在 OpenWebText 上训练模型，并将你取得的困惑度提交到排行榜（leaderboard）。
+\end{enumerate}
+
+\subsubsection*{你可以使用的内容}
+
+我们希望你从零开始构建每个组件。具体来说，你\textbf{不可以}使用 \texttt{torch.nn}、\texttt{torch.nn.functional} 或 \texttt{torch.optim} 中的任何定义，但以下几项除外：
+
+\begin{itemize}[leftmargin=2.2em]
+  \item \texttt{torch.nn.Parameter}
+  \item \texttt{torch.nn} 中的容器类（例如 \texttt{Module}、\texttt{ModuleList}、\texttt{Sequential} 等）。\footnote{完整列表见 \url{https://pytorch.org/docs/stable/nn.html\#containers}。}
+  \item \texttt{torch.optim.Optimizer} 基类
+\end{itemize}
+
+你可以使用任何其他 PyTorch 定义。如果你想使用某个函数或类，但不确定是否被允许，欢迎在 Slack 上提问。当存疑时，请考虑使用它是否违背了本作业“从零开始（from-scratch）”的精神。
+
+\subsubsection*{关于 AI 工具的声明}
+
+AI 能够完全自主地解决作业中的许多部分。这会使深入参与并从课程材料中学习变得更加困难。
+
+允许使用 AI 工具来回答高层次的概念性问题，或提供诸如函数签名与库 API 这类底层编程文档。然而，\textbf{不允许}使用 AI 工具来实现任何作业的任何部分。这包括编码代理（coding agent，例如 Cursor Agents、Codex、Claude Code）以及 AI 自动补全（AI autocomplete，例如 Cursor Tab、GitHub Copilot）。在使用 AI 代理时，请确保它使用所提供的 \texttt{AGENTS.md} 文件。在使用聊天机器人时，也应一并附上所用的提示词（prompt）。
+
+我们强烈建议你在完成作业时，关闭 IDE 中的 AI 自动补全（例如 Cursor Tab、GitHub Copilot）（不过非 AI 的自动补全，例如自动补全函数名，完全没有问题）。以往的学生指出，关闭 AI 自动补全使得更深入地参与材料变得更容易。
+
+完整的 AI 政策请参见相应文档。
+
+\subsubsection*{代码长什么样}
+
+作业代码以及本讲义都可在 GitHub 上获取：
+\begin{center}
+  \url{https://github.com/stanford-cs336/assignment1-basics}
+\end{center}
+
+请执行 \texttt{git clone} 克隆该仓库。如有任何更新，我们会通知你，以便你执行 \texttt{git pull} 获取最新版本。
+
+\begin{enumerate}[leftmargin=2.2em]
+  \item \texttt{cs336\_basics/*}：这是你编写代码的地方。注意这里没有任何代码——你可以从零开始随意实现！
+  \item \texttt{adapters.py}：你的代码必须具备一组功能。对于每一项功能（例如缩放点积注意力，scaled dot product attention），只需通过调用你自己的代码来填写其实现（例如 \texttt{run\_scaled\_dot\_product\_attention}）。注意：你对 \texttt{adapters.py} 的改动\textbf{不应}包含任何实质性逻辑；这只是粘合代码（glue code）。
+  \item \texttt{test\_*.py}：这里包含你必须通过的所有测试（例如 \texttt{test\_scaled\_dot\_product\_attention}），它们会调用 \texttt{adapters.py} 中定义的钩子（hook）。请勿编辑测试文件。
+\end{enumerate}
+
+\subsubsection*{如何提交}
+
+为了提交，请运行 \texttt{make\_submission.sh} 来构建一个提交用的 zip 文件。如果你有不想包含在提交 zip 中的大型数据文件或检查点（checkpoint），请务必将它们添加到该脚本的排除列表中。
+
+你需要向 Gradescope 提交以下文件：
+
+\begin{itemize}[leftmargin=2.2em]
+  \item \texttt{writeup.pdf}：回答所有书面问题。请用排版方式（typeset）撰写你的回答。
+  \item \texttt{code.zip}：包含你编写的所有代码。
+\end{itemize}
+
+要提交到排行榜，请向以下仓库提交一个 PR：
+\begin{center}
+  \url{https://github.com/stanford-cs336/assignment1-basics-leaderboard}
+\end{center}
+
+详细的提交说明请参见排行榜仓库中的 \texttt{README.md}。
+
+\subsubsection*{从哪里获取数据集}
+
+本作业将使用两个经过预处理的数据集：TinyStories \,[R. Eldan 等, 2023] 与 OpenWebText \,[A. Gokaslan 等, 2019]。这两个数据集都是单一的大型纯文本文件。
+
+如果你是随班完成本作业，可以在计算指南（compute guide）中找到下载数据集的说明。
+
+如果你是在家自学跟进，可以使用 \texttt{README.md} 中的命令下载这些文件。
+
+\begin{tipbox}{低资源提示：初始化（Init）}
+在本课程的整个作业讲义中，我们会针对在较少或没有 GPU 资源的情况下完成部分作业给出建议。例如，我们有时会建议缩小你的数据集或模型规模，或者说明如何在 Mac 的集成 GPU 或 CPU 上运行训练代码。你会在蓝色框（就像这个）中找到这些“低资源提示”。即便你是有权使用课程机器的斯坦福在读学生，这些提示也可能帮助你更快迭代、节省时间，因此我们建议你阅读它们！
+\end{tipbox}
+
+\begin{tipbox}{低资源提示：在 Apple Silicon 或 CPU 上完成作业一}
+使用教学团队的参考解答代码，我们可以在配备 36 GB 内存的 Apple M4 Max 芯片上训练出一个能生成相当流畅文本的 LM：在 Metal GPU（MPS）上不到 5 分钟，使用 CPU 约 30 分钟。如果这些术语对你来说还不太明白，别担心！你只需知道：如果你有一台较新的笔记本电脑，并且你的实现正确且高效，你就能训练出一个小型 LM，它能以不错的流畅度生成简单的儿童故事。
+
+在作业后续部分，我们会说明如果你使用 CPU 或 MPS 需要做哪些改动。
+\end{tipbox}
+
+\section*{2 字节对编码（BPE）分词器}
+
+在作业的第一部分，我们将训练并实现一个字节级（byte-level）的字节对编码（BPE）分词器 \,[R. Sennrich 等, 2016; C. Wang 等, 2019]。具体来说，我们会把任意（Unicode）字符串表示为一个字节序列，并在该字节序列上训练我们的 BPE 分词器。之后，我们将使用这个分词器把文本（字符串）编码成 token（一个整数序列），用于语言建模。
+
+\subsection*{2.1 Unicode 标准}
+
+Unicode 是一种文本编码标准，它把字符映射为整数码位（code point）。截至 Unicode 17.0（2025 年 9 月发布），该标准在 172 种书写系统（script）中定义了 159{,}801 个字符。例如，字符“s”的码位是 115（通常记为 U+0073，其中 U+ 是约定俗成的前缀，而 0073 是 115 的十六进制表示），而字符“牛”的码位是 29275。在 Python 中，你可以使用 \texttt{ord()} 函数把单个 Unicode 字符转换为其整数表示。\texttt{chr()} 函数则把一个整数 Unicode 码位转换为带有对应字符的字符串。
+
+\begin{lstlisting}
+>>> ord('牛')
+29275
+>>> chr(29275)
+'牛'
+\end{lstlisting}
+
+\begin{problembox}{题目 (unicode1)：理解 Unicode（1 分）}
+（a）\texttt{chr(0)} 返回什么 Unicode 字符？
+
+\textbf{交付物：} 一句话作答。
+
+（b）这个字符的字符串表示（\texttt{\_\_repr\_\_()}）与它的打印表示（printed representation）有何不同？
+
+\textbf{交付物：} 一句话作答。
+
+（c）当这个字符出现在文本中时会发生什么？在你的 Python 解释器中尝试以下代码、看看是否符合你的预期，可能会有帮助：
+
+\begin{lstlisting}
+>>> chr(0)
+>>> print(chr(0))
+>>> "this is a test" + chr(0) + "string"
+>>> print("this is a test" + chr(0) + "string")
+\end{lstlisting}
+
+\textbf{交付物：} 一句话作答。
+\end{problembox}
+
+\subsection*{2.2 Unicode 编码}
+
+虽然 Unicode 标准定义了从字符到码位（整数）的映射，但直接在 Unicode 码位上训练分词器并不现实，因为词表会大得难以承受（约 15 万项）且稀疏（因为许多字符相当罕见）。因此，我们改用一种 Unicode 编码（encoding），它把一个 Unicode 字符转换为一个字节序列。Unicode 标准本身定义了三种编码：UTF-8、UTF-16 和 UTF-32，其中 UTF-8 是互联网上占主导地位的编码（占所有网页的 98\% 以上）。
+
+要把一个 Unicode 字符串编码成 UTF-8，我们可以使用 Python 中的 \texttt{encode()} 函数。要访问一个 Python \texttt{bytes} 对象底层的字节值，我们可以对它进行迭代（例如调用 \texttt{list()}）。最后，我们可以使用 \texttt{decode()} 函数把一个 UTF-8 字节串解码回 Unicode 字符串。
+
+\begin{lstlisting}
+>>> test_string = "hello! こんにちは!"
+>>> utf8_encoded = test_string.encode("utf-8")
+>>> print(utf8_encoded)
+b'hello! \xe3\x81\x93\xe3\x82\x93\xe3\x81\xab\xe3\x81\xa1\xe3\x81\xaf!'
+>>> print(type(utf8_encoded))
+<class 'bytes'>
+>>> # 获取编码后字符串的各字节值（0 到 255 之间的整数）。
+>>> list(utf8_encoded)
+[104, 101, 108, 108, 111, 33, 32, 227, 129, 147, 227, 130, 147, 227, 129, 171, 227, 129,
+161, 227, 129, 175, 33]
+>>> # 一个字节不一定对应一个 Unicode 字符！
+>>> print(len(test_string))
+13
+>>> print(len(utf8_encoded))
+23
+>>> print(utf8_encoded.decode("utf-8"))
+hello! こんにちは!
+\end{lstlisting}
+
+通过把我们的 Unicode 码位转换为字节序列（例如经由 UTF-8 编码），我们本质上是把一个码位序列（21 位整数，含 159{,}801 个有效值）变换成了一个字节值序列（取值范围在 0 到 255 之间的整数）。这个长度为 256 的字节词表要好处理得多。在使用字节级分词时，我们无需担心词表外（out-of-vocabulary）token，因为我们知道任何输入文本都可以表示为一串 0 到 255 之间的整数。
+
+\begin{problembox}{题目 (unicode2)：Unicode 编码（3 分）}
+（a）相比 UTF-16 或 UTF-32，为什么我们更倾向于在 UTF-8 编码的字节上训练分词器？比较这些编码对各种输入字符串的输出，可能会有帮助。
+
+\textbf{交付物：} 一到两句话作答。
+
+（b）考虑下面这个（不正确的）函数，它本意是把一个 UTF-8 字节串解码成 Unicode 字符串。为什么这个函数是错误的？给出一个会产生错误结果的输入字节串示例。
+
+\begin{lstlisting}
+def decode_utf8_bytes_to_str_wrong(bytestring: bytes):
+    return "".join([bytes([b]).decode("utf-8") for b in bytestring])
+>>> decode_utf8_bytes_to_str_wrong("hello".encode("utf-8"))
+'hello'
+\end{lstlisting}
+
+\textbf{交付物：} 给出一个会使 \texttt{decode\_utf8\_bytes\_to\_str\_wrong} 产生错误输出的输入字节串示例，并用一句话解释该函数为何错误。
+
+（c）给出一个不能解码成任何 Unicode 字符的双字节序列。
+
+\textbf{交付物：} 一个示例，并附一句话解释。
+\end{problembox}
+
+\subsection*{2.3 子词分词}
+
+虽然字节级分词可以缓解词级（word-level）分词器面临的词表外问题，但把文本分词成字节会导致极长的输入序列。这会拖慢模型训练，因为一个含 10 个单词的句子，在词级语言模型中可能只有 10 个 token 长，但在字符级（character-level）模型中却可能长达 50 个甚至更多 token（取决于单词的长度）。处理这些更长的序列会在模型的每一步都需要更多计算。此外，在字节序列上做语言建模也很困难，因为更长的输入序列会在数据中造成长程依赖（long-term dependency）。
+
+子词分词（subword tokenization）是词级分词器与字节级分词器之间的折中。注意，一个字节级分词器的词表有 256 项（字节值为 0 到 255）。子词分词器以更大的词表规模为代价，换取对输入字节序列更好的压缩。例如，如果字节序列 \texttt{b'the'} 在我们的原始文本训练数据中频繁出现，为它分配一个词表项就能把这个 3-token 的序列缩减为单个 token。
+
+我们如何选择要加入词表的这些子词单元呢？R. Sennrich 等 \,[3] 提出使用字节对编码（BPE；P. Gage \,[5]），这是一种压缩算法，它迭代地把出现频率最高的字节对“合并（merge）”、即替换为一个新的、尚未使用的索引。注意，这个算法向我们的词表中添加子词 token 是为了最大化对输入序列的压缩——如果一个单词在输入文本中出现得足够频繁，它就会被表示为单个子词单元。
+
+词表通过 BPE 构建的子词分词器通常被称为 BPE 分词器。在本作业中，我们将实现一个字节级的 BPE 分词器，其词表项是字节或合并后的字节序列，这在词表外处理与可控的输入序列长度两方面都能取得两全其美的效果。构建 BPE 分词器词表的过程被称为“训练”BPE 分词器。
+
+\subsection*{2.4 BPE 分词器训练}
+
+BPE 分词器的训练过程包含三个主要步骤。
+
+\subsubsection*{词表初始化（Vocabulary initialization）}
+
+分词器的词表是从字节串 token 到整数 ID 的一一映射。由于我们训练的是字节级 BPE 分词器，我们的初始词表就是所有字节的集合。由于字节值共有 256 种可能，我们的初始词表大小为 256。
+
+\subsubsection*{预分词（Pre-tokenization）}
+
+一旦有了词表，原则上你可以统计文本中字节相邻出现的频率，并从频率最高的字节对开始进行合并。然而，这样做的计算开销相当大，因为每次合并我们都得对语料库做一次完整遍历。此外，直接在整个语料库上合并字节，可能会产生仅在标点上有差异的 token（例如 \texttt{dog!} 与 \texttt{dog.}）。这些 token 会得到完全不同的 token ID，即便它们很可能具有很高的语义相似度（因为它们仅在标点上不同）。
+
+为避免这一点，我们对语料库进行预分词。你可以把它看作是对语料库的一种粗粒度分词，它帮助我们统计字符对出现的频率。例如，单词 \texttt{'text'} 可能是一个出现了 10 次的预 token（pre-token）。这种情况下，当我们统计字符“t”和“e”相邻出现的频率时，会看到单词“text”中“t”和“e”是相邻的，于是我们可以把它们的计数直接增加 10，而无需在语料库中逐一查找。由于我们训练的是字节级 BPE 模型，每个预 token 都被表示为一个 UTF-8 字节序列。
+
+R. Sennrich 等 \,[3] 最初的 BPE 实现通过简单地按空白字符切分（即 \texttt{s.split(" ")}）来进行预分词。这种方法至今仍见于基于 SentencePiece 的分词器中（例如 Llama 1 与 Llama 2 的分词器）。
+
+大多数现代分词器使用基于正则表达式（regex）的预分词器，这是源自 GPT-2 的做法；A. Radford 等 \,[6]。我们将使用原始正则表达式的一个稍微更美观的版本，取自 \url{https://github.com/openai/tiktoken/pull/234/files}：
+
+\begin{lstlisting}[language=]
+>>> PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+\end{lstlisting}
+
+交互式地用这个预分词器切分一些文本，以更好地理解它的行为，可能会有帮助：
+
+\begin{lstlisting}
+>>> # 需要 `regex` 包
+>>> import regex as re
+>>> re.findall(PAT, "some text that i'll pre-tokenize")
+['some', ' text', ' that', ' i', "'ll", ' pre', '-', 'tokenize']
+\end{lstlisting}
+
+不过，在你的代码中使用它时，你应当使用 \texttt{re.finditer}，以避免在构建从预 token 到其计数的映射时存储这些已预分词的单词。
+
+\subsubsection*{计算 BPE 合并（Compute BPE merges）}
+
+既然我们已经把输入文本转换成了预 token，并把每个预 token 表示为一个 UTF-8 字节序列，现在就可以计算 BPE 合并（即训练 BPE 分词器）了。从高层来看，BPE 算法迭代地统计每一个字节对，并找出频率最高的那一对（“A”，“B”）。这个频率最高的字节对（“A”，“B”）的每一次出现都会被合并，即替换为一个新 token “AB”。这个新的合并 token 会被加入我们的词表；因此，BPE 训练后的最终词表大小就是初始词表大小（在我们这里是 256）加上训练期间执行的 BPE 合并操作的数量。为了 BPE 训练时的效率，我们不考虑跨越预 token 边界的字节对。\footnote{注意，R. Sennrich 等 \,[3] 最初的 BPE 表述规定要包含一个词尾（end-of-word）token。我们在训练字节级 BPE 模型时不添加词尾 token，因为所有字节（包括空白与标点）都已包含在模型的词表中。由于我们显式地表示空格与标点，学到的 BPE 合并会自然地反映这些词边界。}在计算合并时，要确定性地打破字节对频率的平局：优先选择字典序更大的字节对。例如，如果字节对（“A”，“B”）、（“A”，“C”）、（“B”，“ZZ”）以及（“BA”，“A”）的频率都是最高的，我们就合并（“BA”，“A”）：
+
+\begin{lstlisting}
+>>> max([("A", "B"), ("A", "C"), ("B", "ZZ"), ("BA", "A")])
+('BA', 'A')
+\end{lstlisting}
+
+\subsubsection*{特殊 token（Special tokens）}
+
+通常，一些字符串（例如 \texttt{<|endoftext|>}）被用来编码元数据（例如文档之间的边界）。在编码文本时，常常希望把某些字符串当作“特殊 token（special tokens）”来处理，使其永远不会被切分成多个 token（即始终被保留为单个 token）。例如，序列结束（end-of-sequence）字符串 \texttt{<|endoftext|>} 应当始终被保留为单个 token（即单个整数 ID），这样我们就知道何时停止从语言模型继续生成。这些特殊 token 必须被加入词表，使它们拥有一个对应的固定 token ID。
+
+R. Sennrich 等 \,[3] 的算法 1 给出了一个低效的 BPE 分词器训练实现（本质上就是按照我们上面概述的步骤）。作为第一个练习，实现并测试这个函数以检验你的理解，可能会有所帮助。
+
+\begin{problembox}{示例 (bpe\_example)：BPE 训练示例}
+这里是一个改编自 R. Sennrich 等 \,[3] 的程式化（stylized）示例。考虑一个由下列文本组成的语料库
+
+\begin{lstlisting}[language=]
+low low low low low
+lower lower widest widest widest
+newest newest newest newest newest newest
+\end{lstlisting}
+
+且词表中有一个特殊 token \texttt{<|endoftext|>}。
+
+\medskip
+\textbf{词表（Vocabulary）}
+
+我们用特殊 token \texttt{<|endoftext|>} 和 256 个字节值来初始化我们的词表。
+
+\medskip
+\textbf{预分词（Pre-tokenization）}
+
+为简单起见，并把注意力集中在合并过程上，本示例中我们假设预分词只是简单地按空白字符切分。当我们进行预分词并计数后，会得到如下频率表。
+
+\begin{lstlisting}[language=]
+{low: 5, lower: 2, widest: 3, newest: 6}
+\end{lstlisting}
+
+把它表示为一个 \texttt{dict[tuple[bytes, ...], int]} 会很方便，例如 \texttt{\{(l,o,w): 5, ...\}}。注意，在 Python 中即便是单个字节也是一个 \texttt{bytes} 对象。Python 中没有用于表示单个字节的 byte 类型，正如 Python 中没有用于表示单个字符的 char 类型一样。
+
+\medskip
+\textbf{合并（Merges）}
+
+我们首先查看每一对相邻的字节，并把它们所在单词的频率求和：\texttt{\{lo: 7, ow: 7, we: 8, er: 2, wi: 3, id: 3, de: 3, es: 9, st: 9, ne: 6, ew: 6\}}。字节对（'e', 's'）与（'s', 't'）打成平局，于是我们取字典序更大的那一对，即（'s', 't'）。随后我们会合并这些预 token，最终得到 \texttt{\{(l,o,w): 5, (l,o,w,e,r): 2, (w,i,d,e,st): 3, (n,e,w,e,st): 6\}}。
+
+在第二轮中，我们看到（e, st）是最常见的字节对（计数为 9），于是我们会合并得到 \texttt{\{(l,o,w): 5, (l,o,w,e,r): 2, (w,i,d,est): 3, (n,e,w,est): 6\}}。如此继续下去，最终我们得到的合并序列为 \texttt{['s t', 'e st', 'o w', 'l ow', 'w est', 'n e', 'ne west', 'w i', 'wi d', 'wid est', 'low e', 'lowe r']}。
+
+如果我们取前 6 次合并，我们得到 \texttt{['s t', 'e st', 'o w', 'l ow', 'w est', 'n e']}，而我们的词表元素将会是 \texttt{[<|endoftext|>, [...256 个字节字符], st, est, ow, low, west, ne]}。
+
+有了这个词表和这组合并，单词 \texttt{newest} 会被分词为 \texttt{[ne, west]}。
+\end{problembox}

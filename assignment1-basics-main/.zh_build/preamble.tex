@@ -1,0 +1,83 @@
+% ============================================================
+% 共享前导（preamble）—— 所有翻译章节片段共用此设置
+% 引擎：xelatex（需 CJK 支持）
+% ============================================================
+\documentclass[11pt]{ctexart}
+\ctexset{fontset=none}
+
+\usepackage[a4paper,margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+\hypersetup{colorlinks=true,linkcolor=teal!60!black,urlcolor=teal!60!black,citecolor=teal!60!black}
+
+% ---------- 字体（Noto CJK SC 已安装）----------
+\setCJKmainfont{Noto Serif CJK SC}
+\setCJKsansfont{Noto Sans CJK SC}
+\setCJKmonofont{Noto Sans Mono CJK SC}
+
+% ---------- 代码环境 ----------
+\definecolor{codebg}{RGB}{246,246,248}
+\definecolor{codekw}{RGB}{0,90,160}
+\definecolor{codecm}{RGB}{120,120,120}
+\definecolor{codestr}{RGB}{160,60,30}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecm}\itshape,
+  stringstyle=\color{codestr},
+  breaklines=true,
+  breakatwhitespace=false,
+  frame=single,
+  rulecolor=\color{gray!40},
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  tabsize=4,
+  numbers=none,
+  language=Python,
+}
+
+% ---------- 自定义题目/提示框 ----------
+% 题目框（绿色）：用法 \begin{problembox}{题目 (unicode1)：理解 Unicode（1 分）} ... \end{problembox}
+\newtcolorbox{problembox}[1][]{
+  colback=green!4,colframe=green!45!black,fonttitle=\bfseries\sffamily,
+  coltitle=white,breakable,enhanced,boxrule=0.8pt,arc=2pt,
+  left=2mm,right=2mm,top=1.5mm,bottom=1.5mm,title={#1}
+}
+% 低资源提示框（蓝色）：\begin{tipbox}{低资源提示：初始化} ... \end{tipbox}
+\newtcolorbox{tipbox}[1][]{
+  colback=blue!4,colframe=blue!55!black,fonttitle=\bfseries\sffamily,
+  coltitle=white,breakable,enhanced,boxrule=0.8pt,arc=2pt,
+  left=2mm,right=2mm,top=1.5mm,bottom=1.5mm,title={#1}
+}
+% 交付物框（灰色，无标题）：\begin{deliverablebox} ... \end{deliverablebox}
+\newtcolorbox{deliverablebox}{
+  colback=gray!6,colframe=gray!55!black,breakable,enhanced,boxrule=0.6pt,arc=1pt,
+  left=2mm,right=2mm,top=1.2mm,bottom=1.2mm
+}
+
+% ---------- 页眉页脚 ----------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small CS336 作业一（基础）：构建 Transformer 语言模型}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+
+% ---------- 常用数学宏 ----------
+\newcommand{\R}{\mathbb{R}}
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\RMSNorm}{RMSNorm}
+\DeclareMathOperator*{\argmax}{arg\,max}

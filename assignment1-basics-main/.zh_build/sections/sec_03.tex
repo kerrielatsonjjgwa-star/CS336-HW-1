@@ -1,0 +1,182 @@
+\section*{3 Transformer 语言模型架构}
+
+语言模型（language model）接受一批整数词元 ID（token IDs）序列作为输入（即形状为 \texttt{(batch\_size, sequence\_length)} 的 \texttt{torch.Tensor}），并返回（成批的）在词表（vocabulary）上归一化的概率分布（即形状为 \texttt{(batch\_size, sequence\_length, vocab\_size)} 的 PyTorch \texttt{Tensor}），其中对每个输入词元给出的是关于下一个词的预测分布。训练语言模型时，我们用这些下一个词的预测来计算真实的下一个词与预测的下一个词之间的交叉熵损失（cross-entropy loss）。在推理（inference）阶段从语言模型生成文本时，我们取最后一个时间步（即序列中的最后一项）所给出的下一个词预测分布，用它来生成序列中的下一个词元（例如取概率最高的词元、从该分布中采样等），把生成的词元追加到输入序列中，然后重复这一过程。
+
+在本部分作业中，你将从零开始构建这个 Transformer 语言模型。我们会先对模型做一个高层次的描述，再逐步详细介绍各个组件。
+
+\subsection*{3.1 Transformer LM}
+
+给定一段词元 ID 序列，Transformer 语言模型使用输入嵌入（input embedding）将词元 ID 转换为稠密向量，把嵌入后的词元送过 \texttt{num\_layers} 个 Transformer 块（Transformer blocks），然后施加一个可学习的线性投影（即“输出嵌入”（output embedding）或“LM 头”（LM head）），从而产生预测的下一个词元 logits。其原理示意见图 1。
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox{0.92\linewidth}{\centering\itshape
+（图 1）我们的 Transformer 语言模型概览：输入（Inputs）$\to$ 词元嵌入（Token Embedding）$\to$ $\text{num\_layers}$ 个 Transformer 块 $\to$ 归一化（Norm）$\to$ 线性层（输出嵌入）$\to$ Softmax $\to$ 输出概率（Output Probabilities）。\\[4pt]
+（图 2）一个预归一化（pre-norm）Transformer 块：输入张量形状为 $\text{(batch\_size, seq\_len, d\_model)}$；先做归一化（Norm），经因果多头自注意力（Causal Multi-Head Self-Attention，带 RoPE）后做残差相加（Add）；再做归一化（Norm），经逐位置前馈（Position-Wise Feed-Forward）后再做残差相加（Add）；输出张量形状为 $\text{(batch\_size, seq\_len, d\_model)}$。}}
+\caption*{图 1：Transformer 语言模型概览。\quad 图 2：预归一化 Transformer 块。}
+\end{figure}
+
+\paragraph{词元嵌入（Token Embeddings）}
+在最开始的一步，Transformer 把（成批的）词元 ID 序列嵌入为一串向量，这些向量包含了关于词元身份的信息（图 1 中的红色方块）。
+
+更具体地说，给定一段词元 ID 序列，Transformer 语言模型使用一个词元嵌入层（token embedding layer）来产生一串向量。每个嵌入层接收一个形状为 \texttt{(batch\_size, sequence\_length)} 的整数张量，并产生形状为 \texttt{(batch\_size, sequence\_length, d\_model)} 的向量序列。
+
+\paragraph{预归一化 Transformer 块（Pre-norm Transformer Block）}
+在嵌入之后，激活值会被若干结构完全相同的神经网络层处理。一个标准的仅解码器（decoder-only）Transformer 语言模型由 \texttt{num\_layers} 个完全相同的层（通常称为 Transformer“块”）构成。每个 Transformer 块接收一个形状为 \texttt{(batch\_size, sequence\_length, d\_model)} 的输入，并返回一个形状为 \texttt{(batch\_size, sequence\_length, d\_model)} 的输出。每个块通过自注意力（self-attention）在序列上聚合信息，并通过前馈层（feed-forward layers）对其做非线性变换。
+
+在经过 \texttt{num\_layers} 个 Transformer 块之后，我们会取最终的激活值并把它们转化为词表上的一个分布。
+
+我们将实现“预归一化”（pre-norm）Transformer 块（详见 §3.4），它还要求在最后一个 Transformer 块之后使用层归一化（layer normalization，详见下文），以确保其输出被恰当地缩放。
+
+在这次归一化之后，我们会用一个标准的可学习线性变换把 Transformer 块的输出转换为预测的下一个词元 logits（参见，例如，A. Radford 等人著作中的式 (2)）。
+
+\subsection*{3.2 说明：批处理、Einsum 与高效计算}
+
+在整个 Transformer 中，我们会对许多“类批”（batch-like）输入反复执行同一种计算。下面是几个例子：
+
+\begin{itemize}
+\item \textbf{一个批次的各元素：}我们对每个批次元素施加同一个 Transformer 前向操作。
+\item \textbf{序列长度：}像 RMSNorm 和前馈这样的“逐位置”（position-wise）操作，在序列的每个位置上以完全相同的方式运算。
+\item \textbf{注意力头（attention heads）：}注意力操作在多个注意力头上以“多头”（multi-headed）注意力的方式被批处理。
+\end{itemize}
+
+有一种符合人体工学的方式来执行这类操作是很有用的，它既能充分利用 GPU，又易于阅读和理解。许多 PyTorch 操作可以在张量起始处接受多余的“类批”维度，并高效地在这些维度上重复或广播（broadcast）该操作。
+
+举例来说，假设我们在做一个逐位置的、成批的操作。我们有一个形状为 \texttt{(batch\_size, sequence\_length, d\_model)} 的“数据张量”$D$，并希望对它与一个形状为 \texttt{(d\_model, d\_model)} 的矩阵 $A$ 做成批的向量-矩阵乘法。在这种情形下，\texttt{D @ A} 会执行一次成批的矩阵乘法，这在 PyTorch 中是一种高效的基本运算，其中 \texttt{(batch\_size, sequence\_length)} 这两个维度被批处理掉了。
+
+正因如此，假定你的函数可能会被传入额外的类批维度，并把这些维度保持在 PyTorch 形状的起始处，是很有帮助的。为了把张量组织成可以这样批处理的形式，可能需要用许多步 \texttt{view}、\texttt{reshape} 和 \texttt{transpose} 来重塑它们。这会有点麻烦，而且往往很难看清代码在做什么、以及张量的形状是什么。
+
+一个更符合人体工学的选择是在 \texttt{torch.einsum} 中使用 einsum 记号，或者干脆使用与框架无关的库，如 \texttt{einops} 或 \texttt{einx}。其中两个关键操作是 \texttt{einsum}（可对任意维度的输入张量做张量收缩（tensor contraction））和 \texttt{rearrange}（可对任意维度进行重排、拼接和拆分）。事实证明，机器学习中几乎所有操作都是维度调配与张量收缩的某种组合，外加偶尔出现的（通常是逐点的）非线性函数。这意味着，使用 einsum 记号时，你的许多代码都能变得更可读、更灵活。
+
+我们强烈建议你在本课程中学习并使用 einsum 记号。此前没接触过 einsum 记号的同学应该使用 \texttt{einops}（文档见其官网），已经熟悉 \texttt{einops} 的同学则应学习更通用的 \texttt{einx}。\footnote{值得一提的是，\texttt{einops} 有大量支持，而 \texttt{einx} 没有那么久经考验。如果你在使用 \texttt{einx} 时发现任何局限或缺陷，可以随时退回到使用 \texttt{einops} 加一些更朴素的 PyTorch。} 这两个包都已预装在我们提供的环境中。
+
+下面给出一些如何使用 einsum 记号的示例。它们是对 \texttt{einops} 文档的补充，你应当先阅读该文档。
+
+\begin{tipbox}{示例 (einstein\_example1)：用 einops.einsum 做成批矩阵乘法}
+\begin{lstlisting}
+import torch
+from einops import rearrange, einsum
+
+## Basic implementation
+Y = D @ A.T
+# Hard to tell the input and output shapes and what they mean.
+# What shapes can D and A have, and do any of these have unexpected behavior?
+
+## Einsum is self-documenting and robust
+#                          D                A     ->          Y
+Y = einsum(D, A, "batch sequence d_in, d_out d_in -> batch sequence d_out")
+
+## Or, a batched version where D can have any leading dimensions but A is constrained.
+Y = einsum(D, A, "... d_in, d_out d_in -> ... d_out")
+\end{lstlisting}
+\end{tipbox}
+
+\begin{tipbox}{示例 (einstein\_example2)：用 einops.rearrange 做广播运算}
+我们有一批图像，对每张图像都想根据某个缩放因子生成 10 个变暗的版本：
+\begin{lstlisting}
+images = torch.randn(64, 128, 128, 3) # (batch, height, width, channel)
+dim_by = torch.linspace(start=0.0, end=1.0, steps=10)
+
+## Reshape and multiply
+dim_value = rearrange(dim_by,    "dim_value              -> 1 dim_value 1 1 1")
+images_rearr = rearrange(images, "b height width channel -> b 1 height width channel")
+dimmed_images = images_rearr * dim_value
+
+## Or in one go:
+dimmed_images = einsum(
+    images, dim_by,
+    "batch height width channel, dim_value -> batch dim_value height width channel"
+)
+\end{lstlisting}
+\end{tipbox}
+
+\begin{tipbox}{示例 (einstein\_example3)：用 einops.rearrange 做像素混合}
+假设我们有一批以形状 \texttt{(batch, height, width, channel)} 张量表示的图像，并希望对图像的所有像素做一次线性变换，但这一变换应对每个通道独立地进行。我们的线性变换用一个形状为 \texttt{(height * width, height * width)} 的矩阵 $B$ 表示。
+\begin{lstlisting}
+channels_last = torch.randn(64, 32, 32, 3)       # (batch, height, width, channel)
+B = torch.randn(32*32, 32*32)
+
+## Rearrange an image tensor for mixing across all pixels
+channels_last_flat = channels_last.view(
+    -1, channels_last.size(1) * channels_last.size(2), channels_last.size(3)
+)
+channels_first_flat = channels_last_flat.transpose(1, 2)
+channels_first_flat_transformed = channels_first_flat @ B.T
+channels_last_flat_transformed = channels_first_flat_transformed.transpose(1, 2)
+channels_last_transformed = channels_last_flat_transformed.view(*channels_last.shape)
+\end{lstlisting}
+
+改用 \texttt{einops}：
+\begin{lstlisting}
+height = width = 32
+## Rearrange replaces clunky torch view + transpose
+channels_first = rearrange(
+    channels_last,
+    "batch height width channel -> batch channel (height width)"
+)
+channels_first_transformed = einsum(
+    channels_first, B,
+    "batch channel pixel_in, pixel_out pixel_in -> batch channel pixel_out"
+)
+channels_last_transformed = rearrange(
+    channels_first_transformed,
+    "batch channel (height width) -> batch height width channel",
+    height=height, width=width
+)
+\end{lstlisting}
+
+或者，如果你觉得够大胆：用 \texttt{einx.dot}（\texttt{einx} 中对应 \texttt{einops.einsum} 的操作）一步到位：
+\begin{lstlisting}
+height = width = 32
+channels_last_transformed = einx.dot(
+    "batch row_in col_in channel, (row_out col_out) (row_in col_in)"
+    "-> batch row_out col_out channel",
+    channels_last, B,
+    col_in=width, col_out=width
+)
+\end{lstlisting}
+
+这里的第一种实现可以通过在前后加注释来注明输入和输出形状以作改进，但这样做笨拙且容易出错。而使用 einsum 记号时，文档即实现！
+\end{tipbox}
+
+einsum 记号能处理任意的输入批处理维度，但还有一个关键好处：它具有自文档（self-documenting）特性。在使用 einsum 记号的代码中，输入和输出张量的相关形状要清晰得多。对于其余的张量，你可以考虑使用张量类型提示（type hints），例如使用 \texttt{jaxtyping} 库（它并不专属于 JAX）。
+
+我们将在作业二中更多地讨论使用 einsum 记号在性能上的影响，但现在你只需知道：它们几乎总是优于其他替代方案！
+
+\subsubsection*{3.2.1 数学记号与内存排序}
+
+许多机器学习论文在记号中使用行向量（row vectors），这样得到的表示与 NumPy 和 PyTorch 默认采用的行主序（row-major）内存排序契合得很好。在使用行向量时，一个线性变换形如
+
+\begin{equation*}
+y = x W^\top , \tag{1}
+\end{equation*}
+
+其中行主序矩阵 $W \in \R^{d_{\mathrm{out}} \times d_{\mathrm{in}}}$，行向量 $x \in \R^{1 \times d_{\mathrm{in}}}$。注意，这让我们可以通过增大 $x$ 的最外层维度来批处理输入，也就是说，可以把向量输入 $x$ 替换为矩阵输入 $X \in \R^{\mathrm{batch} \times d_{\mathrm{in}}}$。
+
+在线性代数中，一般更常用列向量（column vectors），此时线性变换形如
+
+\begin{equation*}
+y = W x , \tag{2}
+\end{equation*}
+
+其中行主序矩阵 $W \in \R^{d_{\mathrm{out}} \times d_{\mathrm{in}}}$，列向量 $x \in \R^{d_{\mathrm{in}}}$。要在这种约定下批处理输入，$x$ 的批维度必须放在最后，于是 $x$ 需要被替换为矩阵 $\tilde{X} \in \R^{d_{\mathrm{in}} \times \mathrm{batch}}$。
+
+\textbf{在本次作业的数学记号中，我们将主要使用列向量}，因为数学一般遵循这一约定。你应当记住：如果你想使用普通的矩阵乘法记号，就必须像式 (1) 中行向量约定那样对矩阵施加一个转置，因为 PyTorch 使用行主序内存排序。如果你用 einsum 来做线性代数运算，那么只要你正确地标注了各个轴，这就不成问题。顺带一提，值得注意的是，其他语言/线性代数包，如 Matlab、Julia 和 Fortran，都使用列主序（column-major）内存排序，意味着批处理维度排在最后；而 Python 及相关的包采用了 C 标准的行主序排序。
+
+\subsection*{3.3 基础模块：Linear 与 Embedding 模块}
+
+\subsubsection*{3.3.1 参数初始化}
+
+要有效地训练神经网络，往往需要对模型参数做精心的初始化——糟糕的初始化会导致诸如梯度消失（vanishing gradients）或梯度爆炸（exploding gradients）之类的不良行为。预归一化（pre-norm）Transformer 对初始化异乎寻常地稳健，但初始化仍可能对训练速度和收敛产生显著影响。由于这次作业已经很长，我们把细节留到作业三，这里只给你一些在大多数情形下都应表现良好的近似初始化方法。目前，请使用：
+
+\begin{itemize}
+\item \textbf{Linear 权重：}$\mathcal{N}\!\left(\mu = 0,\ \sigma^2 = \dfrac{2}{d_{\mathrm{in}} + d_{\mathrm{out}}}\right)$，在 $[-3\sigma,\, 3\sigma]$ 处截断。
+\item \textbf{Embedding：}$\mathcal{N}(\mu = 0,\ \sigma^2 = 1)$，在 $[-3,\, 3]$ 处截断。
+\item \textbf{RMSNorm：}$\mathbf{1}$（全 1 初始化）。
+\end{itemize}
+
+你应当使用 \texttt{torch.nn.init.trunc\_normal\_} 来初始化截断正态（truncated normal）权重。
+
+\subsubsection*{3.3.2 Linear 模块}
+
+线性层（Linear layers）是 Transformer 乃至一般神经网络的基础构件。首先，你将实现自己的 \texttt{Linear} 类，它继承自 \texttt{torch.nn.Module} 并执行一个线性变换：

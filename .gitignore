@@ -1,0 +1,27 @@
+# ---- Python 虚拟环境 / 缓存(大文件,绝不入库)----
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# ---- 作业脚手架构建产物 ----
+.zh_build/
+.scaffold_build/
+
+# ---- 数据集 / 分词产物 / 训练输出(体积大,不入库)----
+data/
+*.bin
+*.npy
+*.npz
+*.gz
+ckpts/
+checkpoints/
+*.pt
+*.pth
+wandb/
+
+# ---- 本地工具 / 系统 ----
+.claude/
+.DS_Store
+.ipynb_checkpoints/

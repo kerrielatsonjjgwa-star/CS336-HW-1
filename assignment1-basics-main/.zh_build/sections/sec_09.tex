@@ -1,0 +1,144 @@
+% sec_09 —— 续 §7.3 消融、§7.4 OpenWebText、§7.5 排行榜、参考文献（原文第 43-48 页）
+
+这是对原始 Transformer 架构为数不多的「共识」修改之一。原始 Transformer 采用的是后置归一化（post-norm）方式：
+\begin{align*}
+z &= \RMSNorm(x + \operatorname{MultiHeadSelfAttention}(x)) \tag{27} \\
+y &= \RMSNorm(z + \operatorname{FFN}(z)). \tag{28}
+\end{align*}
+
+让我们退回到后置归一化的方式，看看会发生什么。
+
+\begin{problembox}{题目 (pre\_norm\_ablation)：实现 post-norm 并训练（0.5 B200 小时）（1 分）}
+把你的前置归一化（pre-norm）Transformer 实现改成后置归一化（post-norm）。用 post-norm 模型训练，看看会发生什么。
+
+\begin{deliverablebox}
+\textbf{交付物：} 一条 post-norm Transformer 的学习曲线，并与 pre-norm 的曲线对比。
+\end{deliverablebox}
+\end{problembox}
+
+我们会看到，层归一化（layer normalization）对 Transformer 的行为有重大影响，甚至连层归一化所放置的位置都很重要。
+
+\paragraph{消融 2：位置编码（position embeddings）}
+接下来我们研究位置编码对模型性能的影响。具体来说，我们会把基线模型（使用 RoPE）与完全不使用任何位置编码（NoPE，No Position Embedding）进行对比。事实证明，仅含解码器（decoder-only）的 Transformer——也就是像我们所实现的、带因果掩码（causal mask）的模型——在理论上即使不显式提供位置编码，也能推断出相对或绝对的位置信息（见 Y.-H. H. Tsai 等人，2019；A. Kazemnejad 等人，2023）。现在我们就用实验来检验 NoPE 相比 RoPE 的表现如何。
+
+\begin{problembox}{题目 (no\_pos\_emb)：实现 NoPE（0.5 B200 小时）（1 分）}
+把你带 RoPE 的 Transformer 实现修改为完全移除位置编码信息，看看会发生什么。
+
+\begin{deliverablebox}
+\textbf{交付物：} 一条对比 RoPE 与 NoPE 性能的学习曲线。
+\end{deliverablebox}
+\end{problembox}
+
+\paragraph{消融 3：SwiGLU vs.\ SiLU}
+接下来，我们沿用 N. Shazeer（2020）的做法，通过对比 SwiGLU 前馈网络与「使用 SiLU 激活但不带门控线性单元（GLU，Gated Linear Unit）」的前馈网络，来检验门控（gating）在前馈网络中的重要性：
+\[
+\operatorname{FFN}_{\mathrm{SiLU}}(x) = W_2\,\operatorname{SiLU}(W_1 x). \tag{29}
+\]
+
+回忆一下，在我们的 SwiGLU 实现中，内部前馈层的维度大约设为 $d_{\mathrm{ff}} = \tfrac{8}{3}\,d_{\mathrm{model}}$（同时保证 $d_{\mathrm{ff}} \bmod 64 = 0$，以便利用 GPU 的张量核心 tensor core）。在本次消融的基线中，你的 $\operatorname{FFN}_{\mathrm{SiLU}}$ 实现应改为设 $d_{\mathrm{ff}} = 4 \times d_{\mathrm{model}}$，以大致匹配默认 SwiGLU 前馈网络的参数量（后者有三个而非两个权重矩阵）。
+
+\begin{problembox}{题目 (swiglu\_ablation)：SwiGLU vs.\ SiLU（0.5 B200 小时）（1 分）}
+\begin{deliverablebox}
+\textbf{交付物：} 一条在参数量大致匹配的前提下、对比 SwiGLU 与 SiLU 前馈网络性能的学习曲线。
+\end{deliverablebox}
+\begin{deliverablebox}
+\textbf{交付物：} 用几句话讨论你的发现。
+\end{deliverablebox}
+\end{problembox}
+
+\begin{tipbox}{低资源提示：GPU 资源有限的在线学生应在 TinyStories 上测试改动}
+在本作业接下来的部分，我们会转向一个规模更大、噪声更多的网络数据集（OpenWebText），来实验各种架构修改，并（可选地）向课程排行榜提交结果。
+
+在 OpenWebText 上把语言模型训练到流畅需要很长时间，因此我们建议 GPU 资源有限的在线学生继续在 TinyStories 上测试改动（用验证损失作为评估性能的指标）。
+\end{tipbox}
+
+\subsection*{7.4\quad 在 OpenWebText 上运行}
+现在我们转向一个更标准的预训练数据集，它由网络爬取（web crawl）构建而成。我们同样提供了 OpenWebText（A. Gokaslan 等人，2019）的一个小型样本，作为单个文本文件给出：获取该文件的方法见第 1 节。
+
+下面是 OpenWebText 中的一个例子。请注意其中的文本要真实、复杂、多样得多。你或许会想浏览一下训练数据集，以体会网络爬取语料的训练数据是什么样子。
+
+\begin{problembox}{示例 (owt\_example)：来自 OWT 的一个样例}
+\small
+Baseball Prospectus director of technology Harry Pavlidis took a risk when he hired Jonathan Judge.
+
+Pavlidis knew that, as Alan Schwarz wrote in \textit{The Numbers Game}, ``no corner of American culture is more precisely counted, more passionately quantified, than performances of baseball players.'' With a few clicks here and there, you can find out that Noah Syndergaard's fastball revolves more than 2,100 times per minute on its way to the plate \ldots The rising ocean of data has empowered an increasingly important actor in baseball's culture: the analytical hobbyist.
+
+\ldots Pavlidis had a hunch that Judge ``got it'' based on the latter's writing and their interaction at a site-sponsored ballpark event. \lbrack\ldots\rbrack
+\end{problembox}
+
+\noindent\textbf{注意：} 对于本实验，你可能需要重新调整诸如学习率或批大小这样的超参数。
+
+\begin{problembox}{题目 (main\_experiment)：在 OWT 上做实验（2 B200 小时）（2 分）}
+用与 TinyStories 相同的模型架构和相同的总训练迭代次数，在 OpenWebText 上训练你的语言模型。这个模型表现如何？
+
+\begin{deliverablebox}
+\textbf{交付物：} 你的语言模型在 OpenWebText 上的学习曲线。描述与 TinyStories 相比损失的差异——我们应如何解读这些损失？
+\end{deliverablebox}
+\begin{deliverablebox}
+\textbf{交付物：} 用与 TinyStories 输出相同的格式，给出 OpenWebText 语言模型生成的文本。这段文本的流畅度如何？为什么即使我们用了与 TinyStories 相同的模型和算力预算，输出质量却更差？
+\end{deliverablebox}
+\end{problembox}
+
+\subsection*{7.5\quad 你自己的改动 + 排行榜}
+恭喜你走到了这一步，你就快完成了！现在你将尝试改进 Transformer 架构，看看你的超参数和架构与班上其他同学相比表现如何。
+
+\paragraph{排行榜规则}
+除以下限制外没有其他约束：
+\begin{itemize}[leftmargin=*]
+  \item \textbf{运行时间（Runtime）：} 你的提交在一块 B200 上最多运行 45 分钟。如果你使用 SLURM 或 Modal，建议在提交脚本中强制这一限制。
+  \item \textbf{数据（Data）：} 你只能使用我们提供的 OpenWebText 训练数据集。
+\end{itemize}
+除此之外，你可以随心所欲地尝试任何想法。
+
+如果你需要一些实现思路，可以参考以下资源：
+\begin{itemize}[leftmargin=*]
+  \item 最先进的开源大语言模型系列，例如 Llama 3（A. Grattafiori 等人，2024）或 Qwen 2.5（A. Yang 等人，2024）。
+  \item NanoGPT speedrun 仓库（\url{github.com/KellerJordan/modded-nanogpt}），社区成员在此发布了许多用于「竞速（speedrunning）」小规模语言模型预训练的有趣改动。例如，一个可追溯到原始 Transformer 论文的常见改动，是把输入嵌入与输出嵌入的权重绑定（weight tying）在一起（见 A. Vaswani 等人 [8] 第 3.4 节，以及 A. Chowdhery 等人 [16] 第 2 节）。如果你尝试权重绑定，可能需要减小嵌入/语言模型头初始化的标准差。
+\end{itemize}
+在尝试完整的 45 分钟运行之前，你会想先在 OpenWebText 的一个小子集或在 TinyStories 上测试这些改动。
+
+需要提醒的是，你在本排行榜中发现「效果不错」的某些改动，未必能推广到更大规模的预训练。我们会在课程的「缩放定律（scaling laws）」单元中进一步探讨这一点。
+
+\begin{problembox}{题目 (leaderboard)：排行榜（10 B200 小时）（6 分）}
+你将在上述排行榜规则下训练一个模型，目标是在 0.75 B200 小时之内最小化语言模型的验证损失。
+
+\begin{deliverablebox}
+\textbf{交付物：} 记录到的最终验证损失、一条清晰地以「墙钟时间（wall-clock time）少于 45 分钟」为横轴的学习曲线，以及一段你所做工作的说明。我们期望排行榜提交至少要击败 5.0 损失这个朴素基线。提交到此处的排行榜：\url{github.com/stanford-cs336/assignment1-basics-leaderboard}。
+\end{deliverablebox}
+\end{problembox}
+
+\subsection*{参考文献}
+\begingroup
+\small
+\begin{enumerate}[label={[\arabic*]}, leftmargin=*, itemsep=1.5pt]
+  \item R. Eldan and Y. Li, ``TinyStories: How Small Can Language Models Be and Still Speak Coherent English?.'' 2023.
+  \item A. Gokaslan, V. Cohen, E. Pavlick, and S. Tellex, ``OpenWebText corpus.'' 2019.
+  \item R. Sennrich, B. Haddow, and A. Birch, ``Neural Machine Translation of Rare Words with Subword Units,'' in Proc.\ of ACL, 2016.
+  \item C. Wang, K. Cho, and J. Gu, ``Neural Machine Translation with Byte-Level Subwords.'' 2019.
+  \item P. Gage, ``A new algorithm for data compression,'' C Users Journal, vol.\ 12, no.\ 2, pp.\ 23--38, Feb.\ 1994.
+  \item A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, and I. Sutskever, ``Language Models are Unsupervised Multitask Learners.'' 2019.
+  \item A. Radford, K. Narasimhan, T. Salimans, and I. Sutskever, ``Improving Language Understanding by Generative Pre-Training.'' 2018.
+  \item A. Vaswani et al., ``Attention is All you Need,'' in Proc.\ of NeurIPS, 2017.
+  \item T. Q. Nguyen and J. Salazar, ``Transformers without Tears: Improving the Normalization of Self-Attention,'' in Proc.\ of IWSLT, 2019.
+  \item R. Xiong et al., ``On Layer Normalization in the Transformer Architecture,'' in Proc.\ of ICML, 2020.
+  \item J. L. Ba, J. R. Kiros, and G. E. Hinton, ``Layer Normalization.'' 2016.
+  \item H. Touvron et al., ``LLaMA: Open and Efficient Foundation Language Models.'' 2023.
+  \item B. Zhang and R. Sennrich, ``Root Mean Square Layer Normalization,'' in Proc.\ of NeurIPS, 2019.
+  \item A. Grattafiori et al., ``The Llama 3 Herd of Models.'' \url{https://arxiv.org/abs/2407.21783}
+  \item A. Yang et al., ``Qwen2.5 Technical Report,'' arXiv preprint arXiv:2412.15115, 2024.
+  \item A. Chowdhery et al., ``PaLM: Scaling Language Modeling with Pathways.'' 2022.
+  \item D. Hendrycks and K. Gimpel, ``Bridging Nonlinearities and Stochastic Regularizers with Gaussian Error Linear Units.'' 2016.
+  \item S. Elfwing, E. Uchibe, and K. Doya, ``Sigmoid-Weighted Linear Units for Neural Network Function Approximation in Reinforcement Learning.'' \url{https://arxiv.org/abs/1702.03118}
+  \item Y. N. Dauphin, A. Fan, M. Auli, and D. Grangier, ``Language Modeling with Gated Convolutional Networks.'' \url{https://arxiv.org/abs/1612.08083}
+  \item N. Shazeer, ``GLU Variants Improve Transformer.'' 2020.
+  \item J. Su, Y. Lu, S. Pan, B. Wen, and Y. Liu, ``RoFormer: Enhanced Transformer with Rotary Position Embedding.'' 2021.
+  \item D. P. Kingma and J. Ba, ``Adam: A Method for Stochastic Optimization,'' in Proc.\ of ICLR, 2015.
+  \item I. Loshchilov and F. Hutter, ``Decoupled Weight Decay Regularization,'' in Proc.\ of ICLR, 2019.
+  \item T. B. Brown et al., ``Language Models are Few-Shot Learners,'' in Proc.\ of NeurIPS, 2020.
+  \item J. Kaplan et al., ``Scaling Laws for Neural Language Models.'' 2020.
+  \item J. Hoffmann et al., ``Training Compute-Optimal Large Language Models.'' 2022.
+  \item A. Holtzman, J. Buys, L. Du, M. Forbes, and Y. Choi, ``The Curious Case of Neural Text Degeneration,'' in Proc.\ of ICLR, 2020.
+  \item Y.-H. H. Tsai, S. Bai, M. Yamada, L.-P. Morency, and R. Salakhutdinov, ``Transformer Dissection: An Unified Understanding for Transformer's Attention via the Lens of Kernel,'' in Proc.\ of EMNLP-IJCNLP, 2019, pp.\ 4344--4353.
+  \item A. Kazemnejad, I. Padhi, K. Natesan, P. Das, and S. Reddy, ``The Impact of Positional Encoding on Length Generalization in Transformers,'' in NeurIPS, 2023.
+\end{enumerate}
+\endgroup

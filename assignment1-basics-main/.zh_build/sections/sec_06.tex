@@ -1,0 +1,174 @@
+\section*{4 训练 Transformer 语言模型}
+
+我们现在已经具备了对数据进行预处理（通过分词器）和构建模型（Transformer）的步骤。接下来要做的，是搭建支撑训练的全部代码。这包括以下几个部分：
+\begin{itemize}
+  \item \textbf{损失（Loss）}：我们需要定义损失函数（交叉熵，cross-entropy）。
+  \item \textbf{优化器（Optimizer）}：我们需要定义用于最小化该损失的优化器（AdamW）。
+  \item \textbf{训练循环（Training loop）}：我们需要全部配套的基础设施，用于加载数据、保存检查点（checkpoint）以及管理训练过程。
+\end{itemize}
+
+\subsection*{4.1 交叉熵损失}
+
+回顾一下，Transformer 语言模型为每个长度为 $m+1$ 的序列 $x$ 和 $i = 1, \dots, m$ 定义了一个分布 $p_\theta(x_{i+1} \mid x_{1:i})$。给定一个由长度为 $m+1$ 的序列组成的训练集 $D$，我们定义标准的交叉熵（负对数似然，negative log-likelihood）损失函数：
+\begin{equation*}
+\ell(\theta; D) = \frac{1}{|D|\,m} \sum_{x \in D} \sum_{i=1}^{m} -\log p_\theta(x_{i+1} \mid x_{1:i}). \tag{16}
+\end{equation*}
+
+（注意，Transformer 的一次前向传播会同时得到所有 $i = 1, \dots, m$ 对应的 $p_\theta(x_{i+1} \mid x_{1:i})$。）
+
+具体而言，Transformer 为每个位置 $i$ 计算 logits $o_i \in \R^{\texttt{vocab\_size}}$，由此得到：\footnote{注意 $o_i[k]$ 指向量 $o_i$ 在索引 $k$ 处的值。}
+\begin{equation*}
+p(x_{i+1} \mid x_{1:i}) = \softmax(o_i)[x_{i+1}] = \frac{\exp(o_i[x_{i+1}])}{\sum_{a=1}^{\texttt{vocab\_size}} \exp(o_i[a])}. \tag{17}
+\end{equation*}
+
+交叉熵损失一般是相对于 logits 向量 $o_i \in \R^{\texttt{vocab\_size}}$ 与目标 $x_{i+1}$ 来定义的。\footnote{这对应于 $x_{i+1}$ 上的狄拉克 delta（Dirac delta）分布与预测分布 $\softmax(o_i)$ 之间的交叉熵。}
+
+实现交叉熵损失需要像 softmax 那样小心处理数值问题。
+
+\begin{problembox}{题目 (cross\_entropy)：实现交叉熵（1 分）}
+\textbf{交付物：} 编写一个计算交叉熵损失的函数，它接收预测的 logits（$o_i$）和目标（$x_{i+1}$），并计算交叉熵 $\ell_i = -\log \softmax(o_i)[x_{i+1}]$。你的函数应处理以下情况：
+\begin{itemize}
+  \item 为了数值稳定性，减去最大的元素。
+  \item 尽可能抵消 $\log$ 与 $\exp$。
+  \item 处理任何额外的批次（batch）维度，并返回该批次上的平均值。与第 3.2 节一样，我们假设批次类维度总是排在最前面，位于词表大小维度之前。
+\end{itemize}
+实现 \texttt{[adapters.run\_cross\_entropy]}，然后运行 \texttt{uv run pytest -k test\_cross\_entropy} 来测试你的实现。
+\end{problembox}
+
+\subsubsection*{困惑度（Perplexity）}
+
+交叉熵足以用于训练，但当我们评估模型时，还希望报告困惑度（perplexity）。对于一个长度为 $m$、各位置承受交叉熵损失 $\ell_1, \dots, \ell_m$ 的序列：
+\begin{equation*}
+\text{perplexity} = \exp\!\left(\frac{1}{m} \sum_{i=1}^{m} \ell_i\right). \tag{18}
+\end{equation*}
+
+\subsection*{4.2 SGD 优化器}
+
+现在我们有了损失函数，接下来开始探索优化器。最简单的基于梯度的优化器是随机梯度下降（Stochastic Gradient Descent，SGD）。我们从随机初始化的参数 $\theta_0$ 开始。然后对每一步 $t = 0, \dots, T-1$，执行以下更新：
+\begin{equation*}
+\theta_{t+1} \leftarrow \theta_t - \alpha_t \nabla L(\theta_t; B_t), \tag{19}
+\end{equation*}
+其中 $B_t$ 是从数据集 $D$ 中采样的一个随机数据批次，学习率 $\alpha_t$ 与批次大小 $|B_t|$ 是超参数。
+
+\subsubsection*{4.2.1 在 PyTorch 中实现 SGD}
+
+为了实现我们的优化器，我们将继承 PyTorch 的 \texttt{torch.optim.Optimizer} 类。一个 \texttt{Optimizer} 子类必须实现两个方法：
+
+\texttt{def \_\_init\_\_(self, params, ...)} 应当初始化你的优化器。这里，\texttt{params} 将是一个待优化参数的集合（或者是参数组，parameter groups，以便用户希望对模型的不同部分使用不同的超参数，例如不同的学习率）。务必把 \texttt{params} 传给基类的 \texttt{\_\_init\_\_} 方法，基类会存储这些参数以供 \texttt{step} 使用。你可以根据优化器的需要接收额外的参数（例如学习率就是常见的一个），并以字典的形式把它们传给基类构造函数，其中键是你为这些参数选定的名称（字符串）。
+
+\texttt{def step(self)} 应当对参数执行一次更新。在训练循环中，该方法会在反向传播（backward pass）之后被调用，因此你可以访问到上一个批次上的梯度。该方法应当遍历每个参数张量 \texttt{p} 并就地（in place）修改它们，即设置 \texttt{p.data}——它保存着与该参数关联的张量——其依据是梯度 \texttt{p.grad}（如果存在的话），即损失相对于该参数的梯度张量。
+
+PyTorch 的优化器 API 有一些细微之处，因此用一个例子来解释会更容易。为了让我们的例子更丰富，我们将实现一个 SGD 的小变体，其中学习率会随训练衰减：从初始学习率 $\alpha$ 开始，随时间逐步采取越来越小的步长：
+\begin{equation*}
+\theta_{t+1} = \theta_t - \frac{\alpha}{\sqrt{t+1}} \nabla L(\theta_t; B_t) \tag{20}
+\end{equation*}
+
+让我们看看这个版本的 SGD 如何作为一个 PyTorch \texttt{Optimizer} 来实现：
+
+\begin{lstlisting}
+from collections.abc import Callable, Iterable
+from typing import Optional
+import torch
+import math
+
+class SGD(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        defaults = {"lr": lr}
+        super().__init__(params, defaults)
+
+    def step(self, closure: Optional[Callable] = None):
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"] # Get the learning rate.
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                state = self.state[p] # Get state associated with p.
+                t = state.get("t", 0) # Get iteration number from the state, or 0.
+                grad = p.grad.data # Get the gradient of loss with respect to p.
+                p.data -= lr / math.sqrt(t + 1) * grad # Update weight tensor in-place.
+                state["t"] = t + 1 # Increment iteration number.
+
+        return loss
+\end{lstlisting}
+
+在 \texttt{\_\_init\_\_} 中，我们把参数以及默认超参数传给基类构造函数（参数可能成组传入，每组有不同的超参数）。如果参数只是单个 \texttt{torch.nn.Parameter} 对象的集合，基类构造函数会创建一个单独的组，并为其分配默认超参数。然后在 \texttt{step} 中，我们遍历每个参数组，再遍历该组中的每个参数，并应用式 (20)。这里，我们把迭代次数作为与每个参数关联的状态保存：我们先读取该值，将其用于梯度更新，然后再更新它。
+
+API 规定用户可能会传入一个可调用的闭包（closure），用于在优化器步进前重新计算损失。我们要用的优化器并不需要这一点，但为了符合 API，我们还是把它加上。
+
+为了看到它的实际运行效果，我们可以使用下面这个最小的训练循环示例：
+
+\begin{lstlisting}
+weights = torch.nn.Parameter(5 * torch.randn((10, 10)))
+opt = SGD([weights], lr=1)
+
+for t in range(100):
+    opt.zero_grad() # Reset the gradients for all learnable parameters.
+    loss = (weights**2).mean() # Compute a scalar loss value.
+    print(loss.cpu().item())
+
+    loss.backward() # Run backward pass, which computes gradients.
+    opt.step() # Run optimizer step.
+\end{lstlisting}
+
+这就是训练循环的典型结构：在每次迭代中，我们计算损失并运行优化器的一步。当训练语言模型时，我们的可学习参数将来自模型（在 PyTorch 中，\texttt{m.parameters()} 给出这个集合）。损失将在一个采样得到的数据批次上计算，但训练循环的基本结构是一样的。
+
+\begin{problembox}{题目 (learning\_rate\_tuning)：调节学习率（1 分）}
+正如我们将要看到的，对训练影响最大的超参数之一就是学习率。让我们在这个玩具示例中实际看一看。用学习率的另外三个取值——\texttt{1e1}、\texttt{1e2} 和 \texttt{1e3}——运行上面的 SGD 示例，每次仅进行 10 次训练迭代。对于这些学习率，损失各自发生了什么？它衰减得更快、更慢，还是发散了（即在训练过程中不断增大）？\\[2pt]
+\textbf{交付物：} 用一到两句话描述你观察到的行为。
+\end{problembox}
+
+\subsection*{4.3 AdamW}
+
+现代语言模型通常使用比 SGD 更复杂的优化器进行训练。近来使用的大多数优化器都是 Adam 优化器 [D. P. Kingma 等，2015] 的衍生物。我们将使用 AdamW [I. Loshchilov 等，2019]，它在近期工作中被广泛使用。AdamW 对 Adam 提出了一项改进：通过添加权重衰减（weight decay，在每次迭代中把参数拉向 0）来改善正则化，并且这种方式与梯度更新是解耦的（decoupled）。我们将按照 I. Loshchilov 等 [23] 中算法 2 的描述来实现 AdamW。
+
+AdamW 是有状态的：对于每个参数，它都会维护其一阶矩和二阶矩的滑动估计（running estimate）。因此，AdamW 以额外的内存为代价，换取了更好的稳定性和收敛性。除了学习率 $\alpha$ 之外，AdamW 还有一对超参数 $(\beta_1, \beta_2)$，用于控制对矩估计的更新，以及一个权重衰减率 $\lambda$。典型应用将 $(\beta_1, \beta_2)$ 设为 $(0.9, 0.999)$，但像 LLaMA [H. Touvron 等，2023] 和 GPT-3 [T. B. Brown 等，2020] 这样的大型语言模型常常用 $(0.9, 0.95)$ 来训练。该算法可以写成如下形式，其中 $\varepsilon$ 是一个小值（例如 $10^{-8}$），用于在 $v$ 中出现极小值时改善数值稳定性：
+
+\begin{tcolorbox}[colback=white,colframe=black,boxrule=0.6pt,arc=1pt,
+  left=3mm,right=3mm,top=2mm,bottom=2mm,
+  title={\textbf{算法 1：AdamW 优化器}},fonttitle=\normalfont,coltitle=black,
+  colbacktitle=white]
+\begin{tabbing}
+\hspace{0.6cm}\=\hspace{6.2cm}\=\kill
+1 \> \texttt{init($\theta$)} \> $\triangleright$ 初始化可学习参数 \\
+2 \> $m \leftarrow 0$ \> $\triangleright$ 一阶矩向量的初值；与 $\theta$ 形状相同 \\
+3 \> $v \leftarrow 0$ \> $\triangleright$ 二阶矩向量的初值；与 $\theta$ 形状相同 \\
+4 \> \textbf{for} $t = 1, \dots, T$ \textbf{do} \> \\
+5 \> \quad 采样数据批次 $B_t$ \> \\
+6 \> \quad $g \leftarrow \nabla_\theta \ell(\theta; B_t)$ \> $\triangleright$ 计算损失的梯度 \\
+7 \> \quad $\alpha_t \leftarrow \alpha \dfrac{\sqrt{1-\beta_2^t}}{1-\beta_1^t}$ \> $\triangleright$ 计算第 $t$ 次迭代调整后的 $\alpha$ \\[6pt]
+8 \> \quad $\theta \leftarrow \theta - \alpha\lambda\theta$ \> $\triangleright$ 应用权重衰减 \\
+9 \> \quad $m \leftarrow \beta_1 m + (1-\beta_1) g$ \> $\triangleright$ 更新一阶矩估计 \\
+10 \> \quad $v \leftarrow \beta_2 v + (1-\beta_2) g^2$ \> $\triangleright$ 更新二阶矩估计 \\
+11 \> \quad $\theta \leftarrow \theta - \alpha_t \dfrac{m}{\sqrt{v}+\varepsilon}$ \> $\triangleright$ 应用经矩调整的权重更新 \\[6pt]
+12 \> \textbf{end for} \> \\
+\end{tabbing}
+\begin{center}\small 算法 1：AdamW 优化器伪代码。\end{center}
+\end{tcolorbox}
+
+注意 $t$ 从 1 开始。现在你将实现这个优化器。
+
+\begin{problembox}{题目 (adamw)：实现 AdamW（2 分）}
+\textbf{交付物：} 将 AdamW 优化器实现为 \texttt{torch.optim.Optimizer} 的一个子类。你的类应在 \texttt{\_\_init\_\_} 中接收学习率 $\alpha$，以及 $\beta$、$\varepsilon$ 和 $\lambda$ 等超参数。为了帮助你保存状态，基类 \texttt{Optimizer} 提供了一个字典 \texttt{self.state}，它把 \texttt{nn.Parameter} 对象映射到一个字典，该字典存储你为该参数所需的任何信息（对 AdamW 而言，这就是矩估计）。实现 \texttt{[adapters.get\_adamw\_cls]} 并确保它通过 \texttt{uv run pytest -k test\_adamw}。
+\end{problembox}
+
+\begin{problembox}{题目 (adamw\_accounting)：使用 AdamW 训练的资源核算（2 分）}
+让我们计算一下运行 AdamW 需要多少内存和算力。假设我们对每个张量都使用 float32。
+
+\medskip
+（a）运行 AdamW 需要多少峰值内存（peak memory）？请根据参数、激活值（activations）、梯度和优化器状态的内存使用情况，对你的答案进行分解。用 \texttt{batch\_size} 和模型超参数（\texttt{vocab\_size}、\texttt{context\_length}、\texttt{num\_layers}、\texttt{d\_model}、\texttt{num\_heads}）来表示你的答案。假设 $d_{\text{ff}} = \tfrac{8}{3} \times d_{\text{model}}$。
+
+\smallskip
+为简单起见，在计算激活值的内存使用时，只考虑以下几个组成部分：
+\begin{itemize}
+  \item Transformer 块（block）
+  \begin{itemize}
+    \item RMSNorm（一个或多个）
+    \item 多头自注意力（multi-head self-attention）子层：$QKV$ 投影、$QK^\top$ 矩阵乘法、softmax、对值的加权求和、输出投影。
+    \item 逐位置前馈网络（position-wise feed-forward，SwiGLU）：$W_1$、$W_2$、在门控分支（gate branch）上的 SiLU、逐元素乘积、$W_3$
+  \end{itemize}
+\end{itemize}
+\end{problembox}

@@ -1,0 +1,198 @@
+% =====================================================================
+% CS336 作业一（基础）—— 第 38–42 页 中文译文「正文片段」
+% 覆盖：§7 实验、§7.1 如何运行实验与交付物、§7.2 TinyStories、
+%        §7.2.1 超参调优、§7.2.2 组合实现、§7.2.3 调试模型架构的技巧
+%        （并含本块页面上实际出现的 learning\_rate / batch\_size / generate /
+%         layer\_norm\_ablation 题目及 §7.3 开头）
+% =====================================================================
+
+第二个技巧是核采样（nucleus sampling），也称 top-$p$ 采样，我们通过截断低概率词元（token）来修改采样分布。设 $q$ 是我们从一个（经温度缩放的）softmax 得到的概率分布，其大小为 \texttt{vocab\_size}。带超参数 $p$ 的核采样按下式产生下一个词元：
+\begin{equation*}
+P(x_{t+1} = i \mid q) =
+\begin{cases}
+\dfrac{q_i}{\sum_{j \in V(p)} q_j} & \text{若 } i \in V(p) \\[2mm]
+0 & \text{其他情况}
+\end{cases}
+\tag{24}
+\end{equation*}
+其中 $V(p)$ 是满足 $\sum_{j \in V(p)} q_j \ge p$ 的最小索引集合。你可以很容易地计算这个量：先按幅值对概率分布 $q$ 排序，然后从最大的词表元素开始依次选取，直到累计达到目标水平 $p$。
+
+\begin{problembox}{题目 (decoding)：解码（3 分）}
+\textbf{交付物：} 实现一个从你的语言模型进行解码的函数。我们建议你支持以下特性：
+\begin{itemize}
+  \item 为用户提供的提示词（prompt）生成补全（即输入某段 $x_{1\dots t}$，并持续采样补全，直到遇到 \texttt{<|endoftext|>} 词元）。
+  \item 允许用户控制生成词元的最大数量。
+  \item 给定一个期望的温度（temperature）值，在采样之前对预测的下一词元分布应用 softmax 温度缩放。
+  \item Top-$p$ 采样（见 A. Holtzman 等人，2020，也称核采样），由用户指定一个阈值。
+\end{itemize}
+\end{problembox}
+
+\section*{7\quad 实验}
+现在是时候把一切组合起来，在预训练数据集上训练（小型）语言模型了。
+
+\subsection*{7.1\quad 如何运行实验与交付物}
+理解 Transformer 各架构组件背后原理的最佳方式，就是亲自动手修改并运行它。没有什么能替代亲身实践。
+
+为此，能够快速、一致地做实验并记录你的所作所为非常重要。为了快速实验，我们将在一个小规模模型（约 1700 万个总参数）和一个简单数据集（TinyStories）上运行许多实验。为了保持一致性，你将以系统化的方式对组件进行消融（ablation）并改变超参数；而为了保留记录，我们会要求你提交一份实验日志以及与每个实验相关联的学习曲线（learning curve）。
+
+为了能够提交损失曲线，请确保周期性地评估验证损失（validation loss），并同时记录步数和挂钟时间（wall-clock time）。你可能会发现像 Weights and Biases 这样的日志基础设施很有帮助。
+
+\begin{problembox}{题目 (experiment\_log)：实验日志记录（3 分）}
+为你的训练与评估代码创建实验追踪基础设施，使你能够相对于梯度步数和挂钟时间来追踪你的实验和损失曲线。
+\end{problembox}
+
+\begin{deliverablebox}
+\textbf{交付物：} 为你的实验提供日志基础设施代码，以及一份实验日志（记录你为本节后续作业题目所尝试的一切的文档）。
+\end{deliverablebox}
+
+\subsection*{7.2\quad TinyStories}
+我们将从一个非常简单的数据集（TinyStories；R. Eldan 等人，[1]）开始，在该数据集上模型训练得很快，并且我们能看到一些有趣的行为。获取该数据集的说明见第 1 节。该数据集的样子示例如下。
+
+\begin{problembox}{示例 (tinystories\_example)：TinyStories 中的一个例子}
+Once upon a time there was a little boy named Ben. Ben loved to explore the world around him. He saw many amazing things, like beautiful vases that were on display in a store. One day, Ben was walking through the store when he came across a very special vase. When Ben saw it he was amazed! He said, ``Wow, that is a really amazing vase! Can I buy it?'' The shopkeeper smiled and said, ``Of course you can. You can take it home and show all your friends how amazing it is!'' So Ben took the vase home and he was so proud of it! He called his friends over and showed them the amazing vase. All his friends thought the vase was beautiful and couldn't believe how lucky Ben was. And that's how Ben found an amazing vase in the store!
+\end{problembox}
+
+\subsubsection*{7.2.1\quad 超参调优}
+我们会告诉你一些非常基础的超参数作为起点，并要求你为另一些超参数找到效果不错的设置。
+
+\textbf{词表大小（Vocab size）10000。} 典型的词表大小在数万到数十万之间。你应当改变这个值，看看词表和模型行为如何变化。
+
+\textbf{上下文长度（Context length）256。} 像 TinyStories 这样简单的数据集可能不需要很长的序列长度，但对于后面的 OpenWebText 数据，你可能会想要改变它。尝试改变它，观察它对每次迭代运行时间和最终困惑度（perplexity）两方面的影响。
+
+\textbf{\texttt{d\_model} 512。} 这比许多小型 Transformer 论文中所用的 768 维略小，但这会让运行更快。
+
+\textbf{\texttt{d\_ff} 1344。} 这大约是 $\frac{8}{3}\, d_{\text{model}}$，同时又是 64 的倍数，这对 GPU 性能有好处。
+
+\textbf{RoPE 的 theta 参数 $\Theta$ 10000。}
+
+\textbf{层数与头数（Number of layers and heads）4 层，16 个头。} 二者合起来将给出约 1700 万个非嵌入（non-embedding）参数，这是一个相当小的 Transformer。
+
+\textbf{处理的总词元数（Total tokens processed）327{,}680{,}000}（你的 批大小 $\times$ 总步数 $\times$ 上下文长度 应当大致等于这个值）。
+
+你应当通过一些试错来为以下其他超参数找到好的默认值：学习率（learning rate）、学习率预热（learning rate warmup）、其他 AdamW 超参数（$\beta_1$、$\beta_2$、$\varepsilon$）以及权重衰减（weight decay）。你可以在 D. P. Kingma 等人 [22] 中找到这些超参数的一些典型取值。
+
+\subsubsection*{7.2.2\quad 组合实现}
+现在你可以把一切组合起来：获取一个训练好的 BPE 分词器（tokenizer），对训练数据集分词，并在你所编写的训练循环中运行它。\textbf{重要提示：} 如果你的实现正确且高效，上述超参数在 1 块 B200 GPU 上应当导致大约 20–30 分钟的运行时间。如果你的运行时间长得多，请检查并确保你的数据加载、检查点（checkpointing）或验证损失代码没有成为运行时间的瓶颈，并确保你的实现进行了恰当的批处理。
+
+\subsubsection*{7.2.3\quad 调试模型架构的技巧}
+我们强烈建议你熟练使用 IDE 内置的调试器（例如 VSCode/Zed），与用打印语句调试相比，这会为你节省时间。如果你使用文本编辑器，可以使用类似 \texttt{ipdb} 的工具。调试模型架构时的其他一些良好实践包括：
+\begin{itemize}
+  \item 开发任何神经网络架构时，常见的第一步是过拟合（overfit）到单个小批量（minibatch）。如果你的实现正确，你应当能够迅速把训练损失驱动到接近零。
+  \item 在各个模型组件中设置调试断点，并检查中间张量的形状，以确保它们符合你的预期。
+  \item 监控激活值、模型权重和梯度的范数（norm），以确保它们没有爆炸或消失。
+\end{itemize}
+
+\begin{problembox}{题目 (learning\_rate)：调优学习率（2 B200 小时）（3 分）}
+学习率是最重要的待调超参数之一。以你已经训练好的基础模型为出发点，回答以下问题：
+
+\medskip
+（a）在学习率上进行一次超参数扫描（sweep），并报告最终损失（如果优化器发散，则注明发散）。
+
+\begin{deliverablebox}
+\textbf{交付物：} 与多个学习率相关联的学习曲线。解释你的超参数搜索策略。
+\end{deliverablebox}
+
+\begin{deliverablebox}
+\textbf{交付物：} 一个在 TinyStories 上（按每词元计）验证损失至多为 1.45 的模型。
+\end{deliverablebox}
+
+\begin{tipbox}{低资源提示：在 CPU 或 Apple Silicon 上训练若干步}
+如果你在 \texttt{cpu} 或 \texttt{mps} 上运行，你应当转而把处理的总词元数减少到 40{,}000{,}000，这足以产生相当流畅的文本。你也可以把目标验证损失从 1.45 提高到 2.00。
+
+在一块 M4 Max 芯片和 36 GB 内存上运行我们的参考解答代码（已调好学习率），我们使用 批大小 $\times$ 总步数 $\times$ 上下文长度 $= 32 \times 5000 \times 256 = 40{,}960{,}000$ 个词元，这在 \texttt{cpu} 上需要 1 小时 22 分钟，在 \texttt{mps} 上需要 36 分钟。在第 5000 步时，我们达到 1.80 的验证损失。
+
+一些附加提示：
+\begin{itemize}
+  \item 当使用 $N$ 个训练步时，我们建议调整余弦学习率衰减（cosine learning rate decay）调度，使其衰减恰好在第 $N$ 步结束（即达到最小学习率）。
+  \item 当使用 \texttt{mps} 时，不要使用 TF32 内核，即不要设置
+\begin{lstlisting}
+torch.set_float32_matmul_precision('high')
+\end{lstlisting}
+  （在 \texttt{cuda} 设备上你可能会这样做）。我们曾尝试在 \texttt{mps} 上启用 TF32 内核（torch 版本 2.9.0），发现该后端有时会无声地使用有缺陷的内核，从而导致训练不稳定。
+  \item 你可以通过用 \texttt{torch.compile} 对模型进行即时（JIT）编译来加速训练。具体而言：
+  \begin{itemize}
+    \item 在 \texttt{cpu} 上，用以下方式编译你的模型
+\begin{lstlisting}
+model = torch.compile(model)
+\end{lstlisting}
+    \item 在 \texttt{mps} 上，你可以这样对反向传播做一定优化
+\begin{lstlisting}
+model = torch.compile(model, backend="aot_eager")
+\end{lstlisting}
+    截至 torch 版本 2.9.0，\texttt{mps} 上尚不支持使用 Inductor 进行编译。
+  \end{itemize}
+\end{itemize}
+\end{tipbox}
+
+\medskip
+（b）民间经验是说最佳学习率处于“稳定性的边缘（edge of stability）”。研究一下学习率开始发散的那个点与你的最佳学习率之间有何关系。
+
+\begin{deliverablebox}
+\textbf{交付物：} 学习率逐渐增大的学习曲线（其中至少包含一次发散的运行），以及关于这与收敛速率有何关系的分析。
+\end{deliverablebox}
+\end{problembox}
+
+现在让我们改变批大小（batch size），看看训练会发生什么。批大小很重要——它们让我们通过做更大的矩阵乘法从 GPU 获得更高的效率，但我们是否总是希望批大小越大越好呢？让我们运行一些实验来一探究竟。
+
+\begin{problembox}{题目 (batch\_size\_experiment)：批大小变化（1 B200 小时）（1 分）}
+把你的批大小从 1 一直变化到 GPU 显存上限。至少尝试中间的几个批大小，包括 64 和 128 这样的典型大小。
+
+\begin{deliverablebox}
+\textbf{交付物：} 不同批大小各次运行的学习曲线。如有必要应当再次优化学习率。
+\end{deliverablebox}
+
+\begin{deliverablebox}
+\textbf{交付物：} 用几句话讨论你关于批大小及其对训练影响的发现。
+\end{deliverablebox}
+\end{problembox}
+
+有了你的解码器，现在我们可以生成文本了！我们将从模型生成，并看看效果如何。作为参考，你得到的输出应当至少和下面的例子一样好。
+
+\begin{problembox}{示例 (ts\_generate\_example)：一个 TinyStories 语言模型的样例输出}
+Once upon a time, there was a pretty girl named Lily. She loved to eat gum, especially the big black one. One day, Lily's mom asked her to help cook dinner. Lily was so excited! She loved to help her mom. Lily's mom made a big pot of soup for dinner. Lily was so happy and said, ``Thank you, Mommy! I love you.'' She helped her mom pour the soup into a big bowl. After dinner, Lily's mom made some yummy soup. Lily loved it! She said, ``Thank you, Mommy! This soup is so yummy!'' Her mom smiled and said, ``I'm glad you like it, Lily.'' They finished cooking and continued to cook together. The end.
+\end{problembox}
+
+\begin{tipbox}{低资源提示：在 CPU 或 Apple Silicon 上生成文本}
+如果你转而使用处理 40M 词元的低资源配置，你应当看到生成的文本仍然像是英语，但不如上面那样流畅。例如，下面是我们在 40M 词元上训练的 TinyStories 语言模型的样例输出：
+
+\medskip
+Once upon a time, there was a little girl named Sue. Sue had a tooth that she loved very much. It was his best head. One day, Sue went for a walk and met a ladybug! They became good friends and played on the path together.
+
+``Hey, Polly! Let's go out!'' said Tim. Sue looked at the sky and saw that it was difficult to find a way to dance shining. She smiled and agreed to help the talking!``
+
+As Sue watched the sky moved, what it was. She
+\end{tipbox}
+
+下面是精确的题目陈述以及我们的要求：
+
+\begin{problembox}{题目 (generate)：生成文本（1 分）}
+使用你的解码器和训练好的检查点，报告你的模型生成的文本。你可能需要调整解码器参数（温度、top-$p$ 等）以获得流畅的输出。
+
+\begin{deliverablebox}
+\textbf{交付物：} 至少 256 个词元的文本转储（或直到第一个 \texttt{<|endoftext|>} 词元为止），并对该输出的流畅度作简要评论，以及至少两个影响该输出好坏的因素。
+\end{deliverablebox}
+\end{problembox}
+
+\subsection*{7.3\quad 消融与架构修改}
+理解 Transformer 的最佳方式就是亲自修改它并观察它的行为。下面我们将做几个简单的消融与修改。
+
+\paragraph{消融 1：层归一化（layer normalization）}
+人们常说层归一化对 Transformer 训练的稳定性很重要。但也许我们想冒险一把。让我们从每个 Transformer 块中移除 RMSNorm，看看会发生什么。
+
+\begin{problembox}{题目 (layer\_norm\_ablation)：移除 RMSNorm 并训练（0.5 B200 小时）（1 分）}
+从你的 Transformer 中移除所有的 RMSNorm 并训练。在先前的最优学习率下会发生什么？你能否通过使用更低的学习率来获得稳定性？
+
+\begin{deliverablebox}
+\textbf{交付物：} 移除 RMSNorm 并训练时的一条学习曲线，以及在最佳学习率下的一条学习曲线。
+\end{deliverablebox}
+
+\begin{deliverablebox}
+\textbf{交付物：} 用几句话评论 RMSNorm 的影响。
+\end{deliverablebox}
+\end{problembox}
+
+现在让我们研究另一种乍看上去似乎很随意的层归一化选择。前置归一化（pre-norm）的 Transformer 块定义为
+\begin{align*}
+z &= x + \operatorname{MultiHeadSelfAttention}(\RMSNorm(x)) \tag{25} \\
+y &= z + \operatorname{FFN}(\RMSNorm(z)). \tag{26}
+\end{align*}

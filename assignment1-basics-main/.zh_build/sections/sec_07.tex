@@ -1,0 +1,143 @@
+\subsection*{4.4 学习率调度（Learning rate scheduling）}
+
+能让损失下降最快的学习率（learning rate）取值，在训练过程中往往是变化的。在训练 Transformer 时，一种典型做法是使用\textbf{学习率调度}（learning rate schedule）：开始时使用较大的学习率，在前期做出更快的参数更新，随着模型训练再缓慢衰减到较小的取值。\footnote{有时也常用一种学习率会回升（重启，restart）的调度，以帮助跳出局部极小值。}在本作业中，我们将实现用于训练 LLaMA 的余弦退火（cosine annealing）调度 [H. Touvron 等, 2023]。
+
+一个调度器（scheduler）本质上就是一个函数：它接收当前步数 $t$ 以及其他相关参数（例如初始学习率和最终学习率），并返回在第 $t$ 步用于梯度更新的学习率。最简单的调度是常数函数，无论给定任何 $t$ 都返回相同的学习率。
+
+余弦退火学习率调度接收以下输入：(i) 当前迭代步数 $t$，(ii) 最大学习率 $\alpha_{\max}$，(iii) 最小（最终）学习率 $\alpha_{\min}$，(iv) 预热（warm-up）迭代步数 $T_w$，以及 (v) 余弦退火的最终迭代步数 $T_c$。第 $t$ 次迭代的学习率定义如下：
+
+（预热）若 $t < T_w$，则
+\[
+\alpha_t = \frac{t}{T_w}\,\alpha_{\max}.
+\]
+
+（余弦退火）若 $T_w \le t \le T_c$，则
+\[
+\alpha_t = \alpha_{\min} + \frac{1}{2}\left(1 + \cos\!\left(\frac{t - T_w}{T_c - T_w}\,\pi\right)\right)\!\left(\alpha_{\max} - \alpha_{\min}\right).
+\]
+
+（退火后）若 $t > T_c$，则
+\[
+\alpha_t = \alpha_{\min}.
+\]
+
+\begin{problembox}{题目 (learning\_rate\_schedule)：实现带预热的余弦学习率调度（1 分）}
+编写一个函数，它接收 $t$、$\alpha_{\max}$、$\alpha_{\min}$、$T_w$ 和 $T_c$，并按上面定义的调度器返回学习率 $\alpha_t$。然后实现 \texttt{adapters.get\_lr\_cosine\_schedule}，并确保它通过 \texttt{uv run pytest -k test\_get\_lr\_cosine\_schedule}。
+\end{problembox}
+
+\subsection*{4.5 梯度裁剪（Gradient clipping）}
+
+在训练过程中，我们有时会遇到产生很大梯度的训练样本，这会使训练变得不稳定。为缓解这一问题，实践中常用的一种技术是\textbf{梯度裁剪}（gradient clipping）。其思想是：在每次反向传播（backward pass）之后、执行优化器步进之前，对梯度的范数施加一个上限。
+
+给定（所有参数的）梯度 $g$，我们计算它的 $\ell_2$ 范数 $\|g\|_2$。如果该范数小于某个最大值 $M$，则保持 $g$ 不变；否则将 $g$ 按因子 $\dfrac{M}{\|g\|_2 + \varepsilon}$ 缩小（其中加上一个很小的 $\varepsilon$，如 $10^{-6}$，是为了数值稳定性）。注意，缩放后得到的范数会略小于 $M$。
+
+\begin{problembox}{题目 (gradient\_clipping)：实现梯度裁剪（1 分）}
+编写一个实现梯度裁剪的函数。你的函数应接收一个参数列表以及一个最大 $\ell_2$ 范数。它应原地（in place）修改每个参数的梯度。使用 $\varepsilon = 10^{-6}$（PyTorch 的默认值）。然后实现适配器 \texttt{adapters.run\_gradient\_clipping}，并确保它通过 \texttt{uv run pytest -k test\_gradient\_clipping}。
+\end{problembox}
+
+\section*{5 训练循环（Training loop）}
+
+现在我们终于要把目前为止构建的几个主要组件组装到一起：分词后的数据、模型，以及优化器。
+
+\subsection*{5.1 数据加载器（Data Loader）}
+
+分词后的数据（例如你在 \texttt{tokenizer\_experiments} 中准备的数据）是单一的 token 序列 $x = (x_1, \dots, x_n)$。尽管源数据可能由若干独立文档组成（例如不同的网页，或源代码文件），一种常见做法是把所有这些文档拼接成单一的 token 序列，并在它们之间加入分隔符（例如 \texttt{<|endoftext|>} token）。
+
+数据加载器（data loader）会把它转化为一连串的批次（batch），其中每个批次由 $B$ 条长度为 $m$ 的序列组成，并配以对应的"下一个 token"，长度同样为 $m$。例如，当 $B = 1$、$m = 3$ 时，$([x_2, x_3, x_4],\ [x_3, x_4, x_5])$ 就是一个可能的批次。
+
+以这种方式加载数据出于若干原因简化了训练。首先，任意 $1 \le i \le n - m$ 都给出一条有效的训练序列，因此采样训练序列十分简单。由于所有训练序列都具有相同长度，无需对输入序列做填充（pad），这提高了硬件利用率（同时也通过增大批大小 $B$ 来提高利用率）。最后，我们也无需加载整个数据集就能采样训练数据，这使得处理那些原本无法装入内存的大型数据集变得容易。
+
+\begin{problembox}{题目 (data\_loading)：实现数据加载（2 分）}
+\textbf{交付物：} 编写一个函数，它接收一个 numpy 数组 $x$（包含 token ID 的整数数组）、一个 \texttt{batch\_size}、一个 \texttt{context\_length}，以及一个 PyTorch 设备字符串（例如 \texttt{'cpu'} 或 \texttt{'cuda:0'}），并返回一对张量：采样得到的输入序列，以及对应的"下一个 token"目标。两个张量都应具有形状 \texttt{(batch\_size, context\_length)}，包含 token ID，且都应放置在所请求的设备上。为了用我们提供的测试来检验你的实现，你首先需要实现 \texttt{adapters.run\_get\_batch} 处的测试适配器。然后运行 \texttt{uv run pytest -k test\_get\_batch} 来测试你的实现。
+\end{problembox}
+
+\begin{tipbox}{低资源提示：在 CPU 或 Apple Silicon 上加载数据}
+如果你打算在 CPU 或 Apple Silicon 上训练你的语言模型（LM），你需要把数据移动到正确的设备上（类似地，之后你的模型也应使用相同的设备）。
+
+如果你在 CPU 上，可以使用设备字符串 \texttt{'cpu'}；在 Apple Silicon（M* 系列芯片）上，可以使用设备字符串 \texttt{'mps'}。
+
+关于 MPS 的更多信息，请查阅以下资源：
+\begin{itemize}
+\item \url{https://docs.pytorch.org/docs/stable/mps.html}
+\item \url{https://docs.pytorch.org/docs/stable/notes/mps.html}
+\item \url{https://developer.apple.com/documentation/metalperformanceshaders}
+\end{itemize}
+\end{tipbox}
+
+如果数据集太大无法装入内存怎么办？我们可以使用一个名为 \texttt{mmap} 的 Unix 系统调用，它把磁盘上的文件映射到虚拟内存，并在访问到相应内存位置时惰性地（lazily）加载文件内容。这样，你就可以"假装"整个数据集都在内存中。Numpy 通过 \texttt{np.memmap} 实现这一点（如果你最初是用 \texttt{np.save} 保存数组的，则也可对 \texttt{np.load} 使用标志 \texttt{mmap\_mode='r'}），它会返回一个类 numpy 数组的对象，在你访问条目时按需加载。在训练期间从你的数据集（即一个 numpy 数组）采样时，务必以内存映射模式加载数据集（视你保存数组的方式而定，使用 \texttt{np.memmap} 或对 \texttt{np.load} 使用标志 \texttt{mmap\_mode='r'}）。还要确保你指定的 \texttt{dtype} 与你所加载的数组相匹配。明确地验证内存映射数据看起来正确可能会有帮助（例如，不包含超出预期词表大小的取值）。
+
+\subsection*{5.2 检查点（Checkpointing）}
+
+除了加载数据，我们在训练时还需要保存模型。运行作业时，我们经常希望能够恢复一次中途停止的训练（例如，由于作业超时、机器故障等）。即使一切顺利，我们之后也可能希望访问中间模型（例如，事后研究训练动态、在训练的不同阶段从模型中采样等）。
+
+一个检查点（checkpoint）应包含我们恢复训练所需的全部状态。我们当然至少希望能够恢复模型权重。如果使用有状态的优化器（如 AdamW），我们还需要保存优化器的状态（例如，对于 AdamW，即各阶矩估计）。最后，为了恢复学习率调度，我们需要知道停止时所处的迭代步数。PyTorch 让保存这些都很容易：每个 \texttt{nn.Module} 都有一个 \texttt{state\_dict()} 方法，返回一个包含全部可学习权重的字典；之后我们可用配套的 \texttt{load\_state\_dict()} 方法恢复这些权重。任何 \texttt{torch.optim.Optimizer} 也同样如此。最后，\texttt{torch.save(obj, dest)} 可以把一个对象（例如，一个以张量为部分取值、但也包含像整数这样的普通 Python 对象的字典）转储到文件（路径）或类文件对象，之后可用 \texttt{torch.load(src)} 把它加载回内存。
+
+\begin{problembox}{题目 (checkpointing)：实现模型检查点（1 分）}
+实现以下两个用于加载和保存检查点的函数：
+
+\texttt{def save\_checkpoint(model, optimizer, iteration, out)} 应把来自 model、optimizer 和 iteration 的全部状态转储到类文件对象 \texttt{out} 中。你可以使用 model 和 optimizer 二者的 \texttt{state\_dict} 方法获取它们的相关状态，并用 \texttt{torch.save(obj, out)} 把 \texttt{obj} 转储到 \texttt{out}（PyTorch 在此处支持路径或类文件对象）。一种典型选择是让 \texttt{obj} 是一个字典，但只要你之后能加载你的检查点，你可以使用任何你想要的格式。
+
+该函数期望以下参数：
+\begin{itemize}
+\item \texttt{model: torch.nn.Module}
+\item \texttt{optimizer: torch.optim.Optimizer}
+\item \texttt{iteration: int}
+\item \texttt{out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]}
+\end{itemize}
+
+\texttt{def load\_checkpoint(src, model, optimizer)} 应从 \texttt{src}（路径或类文件对象）加载一个检查点，然后从该检查点恢复 model 和 optimizer 的状态。你的函数应返回保存到检查点中的迭代步数。你可以使用 \texttt{torch.load(src)} 恢复你在 \texttt{save\_checkpoint} 实现中所保存的内容，并使用 model 和 optimizer 二者的 \texttt{load\_state\_dict} 方法把它们恢复到之前的状态。
+
+该函数期望以下参数：
+\begin{itemize}
+\item \texttt{src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]}
+\item \texttt{model: torch.nn.Module}
+\item \texttt{optimizer: torch.optim.Optimizer}
+\end{itemize}
+
+实现 \texttt{adapters.run\_save\_checkpoint} 和 \texttt{adapters.run\_load\_checkpoint} 适配器，并确保它们通过 \texttt{uv run pytest -k test\_checkpointing}。
+\end{problembox}
+
+\subsection*{5.3 训练循环（Training loop）}
+
+现在，终于到了把你实现的所有组件组装进你的主训练脚本的时候了。让脚本能够方便地用不同超参数（hyperparameter）启动训练（例如，把它们作为命令行参数接收）会很有回报，因为之后你将多次这样做，以研究不同选择如何影响训练。
+
+\begin{problembox}{题目 (training\_together)：组装到一起（4 分）}
+\textbf{交付物：} 编写一个脚本，运行一个训练循环，在用户提供的输入上训练你的模型。具体而言，我们建议你的训练脚本（至少）允许以下功能：
+\begin{itemize}
+\item 能够配置和控制各种模型与优化器的超参数。
+\item 用 \texttt{np.memmap} 高效地、节省内存地加载大型训练集和验证集。
+\item 把检查点序列化到用户提供的路径。
+\item 周期性地记录训练和验证表现（例如，记录到控制台和/或像 Weights and Biases 这样的外部服务\footnote{\url{https://wandb.ai}}）。
+\end{itemize}
+\end{problembox}
+
+\section*{6 生成文本（Generating text）}
+
+既然我们已经能够训练模型，所需的最后一块拼图就是从模型生成文本的能力。回想一下，语言模型接收一个（可能成批的）长度为 \texttt{sequence\_length} 的整数序列，并产生一个大小为 \texttt{(sequence\_length, vocab\_size)} 的矩阵，其中序列的每个元素都是一个概率分布，预测该位置之后的下一个 token。我们现在将编写几个函数，把它转化为一种为新序列采样的方案。
+
+\subsubsection*{Softmax}
+
+按照标准约定，语言模型的输出是最终线性层的输出（"logits"），因此我们必须通过 softmax 运算把它转化为归一化的概率，这一运算我们在前面的式 (10) 中已经见过。
+
+\subsubsection*{解码（Decoding）}
+
+为了从我们的模型生成文本（解码，decode），我们将给模型提供一段前缀 token 序列（"提示"，prompt），并要求它产生一个在词表上的概率分布，用以预测序列中的下一个 token。然后，我们从这个在词表项上的分布中采样，以确定下一个输出 token。
+
+具体而言，解码过程的一步应接收一个序列 $x_{1\dots t}$，并通过以下方程返回一个 token $x_{t+1}$：
+\begin{equation*}
+P(x_{t+1} = i \mid x_{1\dots t}) = \frac{\exp(v_i)}{\sum_j \exp(v_j)} \tag{21}
+\end{equation*}
+\begin{equation*}
+v = \mathrm{TransformerLM}(x_{1\dots t})_t \in \R^{\texttt{vocab\_size}} \tag{22}
+\end{equation*}
+其中 $\mathrm{TransformerLM}$ 是我们的模型，它接收一个长度为 \texttt{sequence\_length} 的序列作为输入，并产生一个大小为 \texttt{(sequence\_length, vocab\_size)} 的矩阵；我们取这个矩阵的最后一个元素，因为我们要的是第 $t$ 个位置上对下一个 token 的预测。
+
+通过反复地从这些一步条件分布中采样（把先前生成的输出 token 追加到下一个解码时间步的输入中），直到我们生成序列结束 token \texttt{<|endoftext|>}（或用户指定的最大生成 token 数），这就给了我们一个基本的解码器。
+
+\subsubsection*{解码技巧（Decoder tricks）}
+
+我们将用小模型做实验，而小模型有时会生成质量很低的文本。两个简单的解码技巧有助于修正这些问题。首先，在\textbf{温度缩放}（temperature scaling）中，我们用一个温度参数 $\tau$ 来修改 softmax，新的 softmax 为
+\begin{equation*}
+\softmax(v, \tau)_i = \frac{\exp(v_i / \tau)}{\sum_{j=1}^{\texttt{vocab\_size}} \exp(v_j / \tau)}. \tag{23}
+\end{equation*}
+注意，令 $\tau \to 0$ 会使得 $v$ 中最大的元素占据主导，softmax 的输出变成集中于这个最大元素的独热（one-hot）向量。
