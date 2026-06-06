@@ -174,6 +174,11 @@ def main() -> None:
                     g["lr"] = lr
                 logits = model(x)
                 loss = cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
+                if not torch.isfinite(loss):    # NaN/inf 早停
+                    print(f"step {step:6d} | loss={loss.item()} → DIVERGED（发散），提前停止")
+                    if args.wandb_project is not None:
+                        wandb.log({"diverged": 1.0}, step=step)
+                    return
                 optimizer.zero_grad()
                 loss.backward()
                 gradient_clipping(model.parameters(), args.grad_clip)
@@ -229,6 +234,11 @@ def main() -> None:
         x, y = get_batch(train_data, args.batch_size, args.context_length, args.device)
         logits = model(x)
         loss = cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
+        if not torch.isfinite(loss):    # NaN/inf 早停: 优化器发散, 不再空跑
+            print(f"iter {it:6d} | loss={loss.item()} → DIVERGED（发散），提前停止")
+            if args.wandb_project is not None:
+                wandb.log({"diverged": 1.0}, step=it)
+            return
         ###################################################################
         #                             END OF YOUR CODE                            #
         ###################################################################
