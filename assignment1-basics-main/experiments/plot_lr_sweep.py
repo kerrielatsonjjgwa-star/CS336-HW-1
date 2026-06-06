@@ -39,11 +39,11 @@ for lr in LRS:
         continue
     final = vl[-1]
     finals.append((lr, final, div))
-    label = f"lr={lr}" + (" [发散]" if div else f" (val={final:.3f})")
+    label = f"lr={lr}" + (" [DIVERGED]" if div else f" (val={final:.3f})")
     plt.plot(vi, vl, marker="o", ms=3, label=label)
-plt.axhline(1.45, color="r", ls="--", lw=1, label="目标 1.45")
+plt.axhline(1.45, color="r", ls="--", lw=1, label="target 1.45")
 plt.xlabel("iteration"); plt.ylabel("val loss")
-plt.title("TinyStories 学习率 sweep — 验证损失曲线 (full run = 327.68M token/run)")
+plt.title("TinyStories LR sweep - val loss curves (full run = 327.68M tokens/run)")
 plt.legend(); plt.grid(True, alpha=0.3); plt.ylim(1.2, 4.0)
 plt.savefig(os.path.join(OUT_DIR, "exp1_lr_sweep.png"), dpi=120, bbox_inches="tight")
 print("saved exp1_lr_sweep.png；finals =", finals)
@@ -59,9 +59,9 @@ if conv:
 for lr, fl, div in finals:
     if div or fl != fl:
         plt.scatter([float(lr)], [4.0], marker="x", color="red")
-        plt.annotate("发散", (float(lr), 4.0), color="red", fontsize=8)
-plt.axhline(1.45, color="r", ls="--", lw=1, label="目标 1.45")
+        plt.annotate("DIVERGED", (float(lr), 4.0), color="red", fontsize=8)
+plt.axhline(1.45, color="r", ls="--", lw=1, label="target 1.45")
 plt.xscale("log"); plt.xlabel("learning rate (log)"); plt.ylabel("final val loss")
-plt.title("最终验证损失 vs 学习率"); plt.legend(); plt.grid(True, alpha=0.3)
+plt.title("final val loss vs learning rate"); plt.legend(); plt.grid(True, alpha=0.3)
 plt.savefig(os.path.join(OUT_DIR, "exp1_final_vs_lr.png"), dpi=120, bbox_inches="tight")
 print("saved exp1_final_vs_lr.png")
