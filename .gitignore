@@ -20,6 +20,7 @@ checkpoints/
 *.pt
 *.pth
 wandb/
+experiments/runs/
 
 # ---- 本地工具 / 系统 ----
 .claude/
