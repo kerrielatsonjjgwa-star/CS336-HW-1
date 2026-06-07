@@ -23,8 +23,8 @@
 |---|---|---|
 | 校准(测速) | ✅ 完成 | ≈4 it/s @ batch128;600步/run≈3min |
 | 实验 1:LR sweep | ✅ 完成 | 最优 lr=1.5e-3→**1.375**;≥6e-3 软发散(grad_clip 无 NaN) |
-| 实验 2:batch sweep | ⏳ 进行中 | **batch256 OOM**,192 最大可行;跑 64/192 学习曲线 |
-| 实验 3:epoch vs iteration(同 FLOPs) | ⬜ 待开始 | 两种数据加载策略对比 |
+| 实验 2:batch sweep | ✅ 完成 | batch 越小损失越低(64→**1.347**);最大可行≈192,256 OOM |
+| 实验 3:epoch vs iteration(同 FLOPs) | ⏳ 进行中 | epoch 模式 10000 步运行中,与 iteration 1.375 对比 |
 | 实验 4:达到 val/loss < 1.45 | ✅ **达成** | lr=6e-4/1.5e-3/3e-3 均 <1.45,**最低 1.375** |
 
 ---
@@ -74,9 +74,24 @@
 
 ## 实验 2:批大小扫描
 
-**方法**:逐步增大 batch(64 → … → OOM),记录可行的最大 batch、各自吞吐与学习曲线;必要时重调 LR。
+**方法**:固定 lr=1.5e-3(exp1 最优)+ **固定 327.68M token 预算**(步数随 batch 反比,保证同 FLOPs),从大到小试 batch 直到 OOM,记录最终 val loss、显存、学习曲线。
 
-_待填:batch–显存–吞吐表 + 学习曲线图(`plots/exp2_batch_sweep.png`)。_
+### 结果(同 FLOPs)
+| batch | 步数 | 最终 val loss | 显存 |
+|---|---|---|---|
+| 64 | 20000 | **1.3472**(最低) | 10.0 GB |
+| 128 | 10000 | 1.3749 | 19.5 GB |
+| 192 | 6666 | 1.3837 | 28.9 GB |
+| 256 | 5000 | **OOM** ❌ | >32 GB |
+
+![batch sweep](plots/exp2_batch_sweep.png)
+
+![batch final](plots/exp2_batch_final.png)
+
+### 发现
+- **同 FLOPs 下 batch 越小 → val loss 越低**:64(1.347)< 128(1.375)< 192(1.384)。小 batch 步数多、梯度更新次数多,收敛更充分;大 batch 更新少、最终损失略高。
+- **显存随 batch 近线性**:64→10G,128→19.5G,192→28.9G;**5090(32G)最大可行 batch ≈ 192**,**batch=256 OOM**(`CUDA out of memory`,需 ~32GB+)。
+- **权衡**:小 batch 损失更低但 wall-clock 更慢(更多步、GPU 利用率低 ~40%);大 batch 训练快、GPU 吃满,但损失略高且逼近显存上限。lr=1.5e-3 在各 batch 都稳定,**无需再调 LR**。
 
 ---
 
