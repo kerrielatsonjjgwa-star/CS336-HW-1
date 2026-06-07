@@ -20,8 +20,8 @@ checkpoints/
 *.pt
 *.pth
 wandb/
-experiments/runs/
-experiments/plots/
+assignment1-basics-main/experiments/runs/
+assignment1-basics-main/experiments/plots/
 
 # ---- 本地工具 / 系统 ----
 .claude/
