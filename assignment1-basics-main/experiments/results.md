@@ -130,6 +130,23 @@
 
 ---
 
+## 附加:加速(torch.compile + bf16)与 Muon 优化器(Kimi 风格)
+
+先 profile 单步:**数据准备仅占 0.5%,GPU 计算占 99.5%** → 瓶颈是 GPU 端(小模型 = 小 kernel + 显存带宽),不是数据加载。故针对 GPU 优化(代码见 `experiments/train_fast.py`、`cs336_basics.optimizer.Muon`):
+
+| 变体 | 稳态吞吐 | 加速 | 300 步 val loss |
+|---|---|---|---|
+| A 基线(fp32 + AdamW) | 162k tok/s(4.96 it/s) | 1.0× | 2.741 |
+| B + bf16 autocast | 220k tok/s | **1.36×** | 2.793 |
+| C + torch.compile + bf16 | 413k tok/s | **2.55×** | 2.775 |
+| **D + Muon(Kimi 风格)** | **457k tok/s(13.9 it/s)** | **2.82×** | **2.417** |
+
+**结论:**
+- **bf16**(matmul 半精度,损失/RMSNorm 仍 fp32)→ 1.36×;**torch.compile**(融合小 kernel)再叠加到 **2.55×**(印证瓶颈是 kernel 启动开销)。
+- **Muon**(2D 隐藏权重做 Newton-Schulz 正交化更新,embedding/lm_head/norm 仍 AdamW):速度与 AdamW 相当,但 **300 步 val 显著更低(2.42 vs 2.77)** → 印证 Kimi"Muon 更高效"的说法(收敛更快)。
+- **综合 2.82×:full run 从 ~33.5min 降到 ~12min**(327.68M tok ÷ 457k tok/s ≈ 717s)。
+- ⚠️ bf16/compile 数值与 fp32 略有差异,**前 4 个实验结论仍以 fp32 为准**;加速用于今后新实验。
+
 ## 结论
 
 四个实验在 RTX 5090 上自动完成(固定 17M 参数模型,每次 full run = 327.68M token,~33min)。
