@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 RUN_DIR, OUT_DIR = "experiments/runs", "experiments/plots"
 os.makedirs(OUT_DIR, exist_ok=True)
-LRS = ["1e-4", "3e-4", "6e-4", "1.5e-3", "3e-3"]   # sweep 的 5 个学习率
+LRS = ["1e-4", "3e-4", "6e-4", "1.5e-3", "3e-3", "6e-3", "1.2e-2"]   # 5 主 + 2 高(找发散)
 
 VAL_RE = re.compile(r"iter\s+(\d+)\s+\|\s+val/loss\s+([\d.]+|nan|inf)")
 

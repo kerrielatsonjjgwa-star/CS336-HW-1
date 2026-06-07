@@ -7,7 +7,7 @@ set -u
 LR=1.5e-3
 TOK=327680000
 CTX=256
-for b in 64 192 256; do
+for b in 256 192 64; do   # 先大(找 OOM 边界)后小,尽早出 OOM 结论
   steps=$(( TOK / (b * CTX) ))
   evalint=$(( steps / 20 )); [ "$evalint" -lt 1 ] && evalint=1
   name="batch_${b}"
