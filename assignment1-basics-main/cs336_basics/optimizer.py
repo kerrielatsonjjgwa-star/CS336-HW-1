@@ -195,3 +195,78 @@ def get_lr_cosine_schedule(
     #######################################################################
     #                             END OF YOUR CODE                            #
     #######################################################################
+
+
+# ============================== Muon 优化器 ==============================
+# 参考 Keller Jordan 原版 Muon + Moonshot/Kimi「Muon is Scalable」的工程改进:
+#   - 把动量更新用 Newton-Schulz 五次迭代「正交化」(近似 U·Vᵀ),让各奇异方向步长均衡,
+#     比 Adam 更高效地利用每一步梯度;
+#   - Kimi 的可扩展改进: 解耦权重衰减(decoupled wd) + 按 sqrt(max(1, fan_out/fan_in)) 缩放更新,
+#     统一不同形状权重的更新 RMS,使其与 AdamW 量级可比、可直接配合余弦调度。
+# 仅适用于 2D 隐藏权重(attn / ffn 矩阵); embedding / lm_head / norm 等交给 AdamW。
+
+
+def newton_schulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """对 2D 矩阵 G 做 Newton-Schulz 五次迭代正交化(在 bf16 上算,快且省显存)。
+
+    返回与 G 同形、奇异值≈1 的近似正交矩阵。系数 (a,b,c) 为 Keller Jordan 调优值。
+    """
+    assert G.ndim == 2, "newton_schulz5 仅支持 2D 矩阵"
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.bfloat16()
+    transpose = G.size(0) > G.size(1)        # 让行数≤列数, 迭代更稳
+    if transpose:
+        X = X.mT
+    X = X / (X.norm() + eps)                  # 归一化使奇异值落入收敛区间
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transpose:
+        X = X.mT
+    return X.to(G.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon(MomentUm Orthogonalized by Newton-schulz),Kimi 风格,仅用于 2D 隐藏权重。
+
+    Args:
+        params: 仅 2D 权重(attn/ffn 矩阵);其余参数请用 AdamW。
+        lr: 学习率(因更新已正交归一,通常比 AdamW 大,如 0.02)。
+        momentum: 动量系数(默认 0.95)。
+        weight_decay: 解耦权重衰减(Kimi 改进,默认 0.1)。
+        nesterov: 是否用 Nesterov 动量(默认 True)。
+        ns_steps: Newton-Schulz 迭代步数(默认 5)。
+    """
+
+    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
+                 weight_decay: float = 0.1, nesterov: bool = True, ns_steps: int = 5):
+        if lr < 0:
+            raise ValueError(f"非法 lr={lr}")
+        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay,
+                        nesterov=nesterov, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            lr = group["lr"]; mom = group["momentum"]; wd = group["weight_decay"]
+            nesterov = group["nesterov"]; ns = group["ns_steps"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                if g.ndim != 2:
+                    raise ValueError("Muon 只接受 2D 参数;请把 embedding/lm_head/norm 交给 AdamW")
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(mom).add_(g)                                # 动量累积
+                upd = g.add(buf, alpha=mom) if nesterov else buf     # Nesterov 动量
+                ortho = newton_schulz5(upd, ns)                      # 正交化更新方向
+                p.mul_(1 - lr * wd)                                  # 解耦权重衰减(Kimi)
+                scale = max(1.0, p.size(0) / p.size(1)) ** 0.5       # 统一更新 RMS
+                p.add_(ortho, alpha=-lr * scale)
+        return loss
