@@ -76,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         help="epoch 数：设置后启用 epoch 模式（iter_epoch_batches 无放回遍历，覆盖 --max-iters；"
              "余弦周期自动取 epochs×每epoch步数）",
     )
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="epoch 模式下的全局步数上限：达到即停，且余弦周期取此值（用于与 iteration 模式同 FLOPs 对比）",
+    )
 
     # ---- 数据 / checkpoint / 日志路径 ----
     p.add_argument("--train-data", type=str, required=True, help="训练 token 的 .npy/.bin 路径（uint16 1D）")
@@ -162,8 +168,9 @@ def main() -> None:
     # ============ epoch 模式（--epochs 启用：无放回遍历不重叠窗口，跑完即返回）============
     if args.epochs and args.epochs > 0:
         steps_per_epoch = ((len(train_data) - 1) // args.context_length) // args.batch_size
-        total_steps = args.epochs * steps_per_epoch
-        print(f"[epoch 模式] {args.epochs} epoch × {steps_per_epoch} 步/epoch = {total_steps} 步（余弦周期取 {total_steps}）")
+        total_steps = args.max_steps if args.max_steps else args.epochs * steps_per_epoch
+        print(f"[epoch 模式] {args.epochs} epoch × {steps_per_epoch} 步/epoch；总步数(余弦周期)={total_steps}"
+              + ("（--max-steps 上限）" if args.max_steps else ""))
         step = start_iter
         for epoch in range(args.epochs):
             for x, y in iter_epoch_batches(
@@ -197,7 +204,11 @@ def main() -> None:
                     save_checkpoint(model, optimizer, step + 1,
                                     os.path.join(args.checkpoint_dir, f"ckpt_{step + 1}.pt"))
                 step += 1
+                if args.max_steps and step >= args.max_steps:
+                    break
             print(f"===== epoch {epoch + 1}/{args.epochs} 完成（累计 {step} 步）=====")
+            if args.max_steps and step >= args.max_steps:
+                break
 
         if valid_data is not None:
             val_loss = evaluate(model, valid_data, args.batch_size, args.context_length, args.device)
